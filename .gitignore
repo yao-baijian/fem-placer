@@ -174,5 +174,3 @@ result/*
 /*.csv
 *.png
 *.drawio
-
-benchmarks/vtr/
