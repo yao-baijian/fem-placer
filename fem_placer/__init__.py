@@ -11,6 +11,13 @@ from .legalizer import Legalizer
 from .router import Router
 from .optimizer import FPGAPlacementOptimizer
 from .timer import Timer
+from .timing_analyzer import (
+    TimingAnalyzer,
+    TimingSummary,
+    analyze_placement_timing,
+    parse_vivado_timing,
+    generate_vivado_timing_tcl,
+)
 
 # QUBO approach (site_coords_matrix based)
 from .objectives import (
@@ -46,6 +53,11 @@ __all__ = [
     'Router',
     'FPGAPlacementOptimizer',
     'Timer',
+    'TimingAnalyzer',
+    'TimingSummary',
+    'analyze_placement_timing',
+    'parse_vivado_timing',
+    'generate_vivado_timing_tcl',
 
     # QUBO functions
     'get_site_distance_matrix',

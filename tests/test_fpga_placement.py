@@ -17,7 +17,10 @@ from fem_placer import (
     PlacementDrawer,
     Legalizer,
     Router,
-    FPGAPlacementOptimizer
+    FPGAPlacementOptimizer,
+    TimingAnalyzer,
+    analyze_placement_timing,
+    parse_vivado_timing,
 )
 from fem_placer.logger import *
 from fem_placer.config import *
@@ -48,6 +51,24 @@ def get_vivado_place_times(logs_dir='./vivado/output_dir'):
 
 vivado_place_times = get_vivado_place_times()
 
+# Timing analysis configuration
+TIMING_CLOCK_PERIOD_NS = 5.0  # 200 MHz target
+
+def get_vivado_timing_metrics(instance_dir='./vivado/output_dir'):
+    """Read Vivado timing metrics if available."""
+    metrics = {}
+    metrics_file = os.path.join(instance_dir, 'timing_metrics.txt')
+    if os.path.isfile(metrics_file):
+        try:
+            with open(metrics_file, 'r') as f:
+                for line in f:
+                    if ':' in line:
+                        key, val = line.split(':', 1)
+                        metrics[key.strip()] = val.strip()
+        except Exception:
+            pass
+    return metrics
+
 SET_LEVEL('INFO')
 
 # instances = ['c2670', 'c5315', 'c6288', 'c7552',
@@ -62,7 +83,7 @@ SET_LEVEL('INFO')
 
 # instances = ['c2670_boundary']
 
-instances = ['RLE_BlobMerging_boundary']
+instances = ['FPGA-example2']
 
 # 'bgm_boundary', 'RLE_BlobMerging_boundary', 'sha1_boundary'
 
@@ -79,14 +100,16 @@ anneal='exp'
 io_factor = 1
 
 print(f"{'Benchmarks':<12} {'Instance':<10} {'Inst':<6} {'IO Inst':<6} {'Net/Total':<14} {'Overlap':<8} "
-    f"{'Alpha':<8} {'Beta':<8} {'HPWL Init':<18} {'HPWL Final':<16} {'HPWL Vivado':<12} {'Time(s)':<10} {'VivadoTime(s)':<14}")
+    f"{'Alpha':<8} {'Beta':<8} {'HPWL Init':<18} {'HPWL Final':<16} {'HPWL Vivado':<12} "
+    f"{'Time(s)':<10} {'VivadoT(s)':<10} "
+    f"{'FEM-WNS(ns)':<14} {'FEM-Fmax':<12} {'Vvd-WNS':<12} {'Vvd-Fmax':<12}")
 
 for instance in instances:
-    place_type = PlaceType.IO
+    place_type = PlaceType.CENTERED
     debug = False
     fpga_placer = FpgaPlacer(place_orientation = place_type, 
                             grid_type = GridType.SQUARE,
-                            place_mode = IoMode.VIRTUAL_NODE,
+                            place_mode = IoMode.NORMAL,
                             utilization_factor = 0.4,
                             debug = debug,
                             device = dev)
@@ -162,16 +185,51 @@ for instance in instances:
         all_coords = torch.cat([placement_legalized[0], placement_legalized[1]], dim=0)
         routes = router.route_connections(fpga_placer.net_manager.insts_matrix, all_coords)
         vivado_time_str = str(vivado_place_times.get(instance, 'N/A'))
+        
+        # --- Timing Analysis (Framework) ---
+        timing_result = analyze_placement_timing(
+            fpga_placer,
+            placement_legalized[0],
+            placement_legalized[1],
+            include_io=True,
+            clock_period_ns=TIMING_CLOCK_PERIOD_NS,
+        )
+        
+        # --- Timing Analysis (Vivado) ---
+        vivado_timing = get_vivado_timing_metrics(f'./vivado/output_dir/{instance}')
+        vvd_wns = vivado_timing.get('WNS', 'N/A')
+        vvd_fmax = vivado_timing.get('Fmax (MHz)', 'N/A')
+        
         print(f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} {inst_num['io_inst_num']:<6} {net_ratio:<14} {overlap:<8} "
-            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl']:<18.2f} {fem_hpwl_final['hpwl']:<16.2f} {vivado_hpwl['hpwl']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<14}")
+            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl']:<18.2f} {fem_hpwl_final['hpwl']:<16.2f} {vivado_hpwl['hpwl']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<10} "
+            f"{timing_result.wns*1e9:<14.3f} {timing_result.fmax:<12.1f} {vvd_wns:<12} {vvd_fmax:<12}")
     else:
         real_logic_coords = config[optimal_inds[0]]
         placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(real_logic_coords, logic_ids)
         routes = router.route_connections(fpga_placer.net_manager.insts_matrix, (placement_legalized[0]))
         vivado_time_str = str(vivado_place_times.get(instance, 'N/A'))
+        
+        # --- Timing Analysis (Framework) ---
+        timing_result = analyze_placement_timing(
+            fpga_placer,
+            placement_legalized[0],
+            clock_period_ns=TIMING_CLOCK_PERIOD_NS,
+        )
+        
+        # --- Timing Analysis (Vivado) ---
+        vivado_timing = get_vivado_timing_metrics(f'./vivado/output_dir/{instance}')
+        vvd_wns = vivado_timing.get('WNS', 'N/A')
+        vvd_fmax = vivado_timing.get('Fmax (MHz)', 'N/A')
+        
         print(f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} {inst_num['io_inst_num']:<6} {net_ratio:<14} {overlap:<8} "
-            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl_no_io']:<18.2f} {fem_hpwl_final['hpwl_no_io']:<16.2f} {vivado_hpwl['hpwl_no_io']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<14}")
+            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl_no_io']:<18.2f} {fem_hpwl_final['hpwl_no_io']:<16.2f} {vivado_hpwl['hpwl_no_io']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<10} "
+            f"{timing_result.wns*1e9:<14.3f} {timing_result.fmax:<12.1f} {vvd_wns:<12} {vvd_fmax:<12}")
     
+    # Print detailed timing report
+    print()
+    print(timing_result.format_report())
+    print()
+
     if draw_loss_function:
         global_drawer.plot_fpga_placement_loss(f'result/{instance}/hpwl_loss.png')
 

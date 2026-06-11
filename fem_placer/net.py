@@ -3,6 +3,7 @@ import os
 import torch
 import rapidwright
 import numpy as np
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Set, Tuple, List, Optional
 from com.xilinx.rapidwright.design import Design, Net
@@ -65,33 +66,139 @@ class NetManager:
         self.nets = design.getNets()
         self.net_names = [net.getName() for net in self.nets]
 
-        for net in self.nets:
-            net_name = net.getName()
-            self.hpwl_calculator.compute_net_hpwl_rapidwright(net, 
-                                                              net_name, 
-                                                              include_io=True, 
-                                                              logic_instances=logic_instances, 
-                                                              io_instances=io_instances)
+        total_nets = len(self.nets)
+        hpwl_io_count = 0
+        hpwl_no_io_count = 0
 
-        for net in self.nets:
+        # ---- Single-pass HPWL + logic depth + degree estimation ----
+        # Previously: 2 passes for HPWL + 1 for logic_depth + 1 for degrees = 4 passes.
+        # Now: 1 pass does all.
+
+        # For logic depth estimation
+        site_connectivity = {}
+        # For degree estimation
+        degrees = []
+
+        for idx, net in enumerate(self.nets):
             net_name = net.getName()
-            self.hpwl_calculator.compute_net_hpwl_rapidwright(net, 
-                                                              net_name, 
-                                                              include_io=False, 
-                                                              logic_instances=logic_instances, 
-                                                              io_instances=io_instances)
+
+            if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
+                # Still need to try both include_io variants to keep dicts consistent
+                self.hpwl_calculator.compute_net_hpwl_rapidwright(
+                    net, net_name, include_io=True,
+                    logic_instances=logic_instances, io_instances=io_instances
+                )
+                self.hpwl_calculator.compute_net_hpwl_rapidwright(
+                    net, net_name, include_io=False,
+                    logic_instances=logic_instances, io_instances=io_instances
+                )
+                continue
+
+            pins = net.getPins()
+            if len(pins) < 2:
+                continue
+
+            # --- Single pin iteration for ALL metrics ---
+            logic_coords_set = set()
+            all_coords_set = set()
+            sites_in_net = set()
+            logic_sites_in_net = set()
+
+            for pin in pins:
+                site_inst = pin.getSiteInst()
+                if not site_inst:
+                    continue
+
+                site_name = site_inst.getName()
+                sites_in_net.add(site_name)
+
+                is_logic = logic_instances.has_name(site_name) if logic_instances else False
+                is_io = io_instances.has_name(site_name) if io_instances else False
+
+                if not is_logic and not is_io:
+                    continue
+
+                coord = (site_inst.getInstanceX(), site_inst.getInstanceY())
+                all_coords_set.add(coord)
+
+                if is_logic:
+                    logic_coords_set.add(coord)
+                    logic_sites_in_net.add(site_name)
+
+            # --- HPWL with IO ---
+            if len(all_coords_set) >= 2:
+                hpwl, bbox = self.hpwl_calculator._compute_hpwl_from_coordinates(
+                    list(all_coords_set)
+                )
+                self.hpwl_calculator.net_hpwl[net_name] = hpwl
+                self.hpwl_calculator.net_bbox[net_name] = bbox
+                self.hpwl_calculator.total_hpwl += hpwl
+                hpwl_io_count += 1
+
+            # --- HPWL without IO ---
+            if len(logic_coords_set) >= 2:
+                hpwl_no_io, bbox_no_io = self.hpwl_calculator._compute_hpwl_from_coordinates(
+                    list(logic_coords_set)
+                )
+                self.hpwl_calculator.net_hpwl_no_io[net_name] = hpwl_no_io
+                self.hpwl_calculator.net_bbox_no_io[net_name] = bbox_no_io
+                self.hpwl_calculator.total_hpwl_no_io += hpwl_no_io
+                hpwl_no_io_count += 1
+
+            # --- Logic depth: update site connectivity (from all sites in net) ---
+            for site in sites_in_net:
+                site_connectivity[site] = site_connectivity.get(site, 0) + len(sites_in_net)
+
+            # --- Net degree: count logic sites in this net ---
+            if len(logic_sites_in_net) >= 2:
+                degrees.append(len(logic_sites_in_net))
+
+            # Progress indicator for large designs
+            if total_nets > 100000 and (idx + 1) % 50000 == 0:
+                INFO(f"  HPWL progress: {idx+1}/{total_nets} nets processed ({100*(idx+1)//total_nets}%)")
 
         hpwl = self.hpwl_calculator.get_hpwl()
-        INFO(f"Nets num: {len(self.nets)}, total hpwl: {hpwl['hpwl']:.2f}, without io: {hpwl['hpwl_no_io']:.2f} ")
-        
-        # Estimate logic depth from the design
-        self._estimate_logic_depth()
-        self._calculate_net_degrees()
-        
+        INFO(f"Nets num: {total_nets}, total hpwl: {hpwl['hpwl']:.2f}, without io: {hpwl['hpwl_no_io']:.2f} "
+             f"(hpwl_io_nets={hpwl_io_count}, hpwl_no_io_nets={hpwl_no_io_count})")
+
+        # --- Estimate logic depth from collected data ---
+        self._estimate_logic_depth_from_data(site_connectivity)
+
+        # --- Calculate net degrees from collected data ---
+        self._calculate_net_degrees_from_data(degrees)
+
         if self.debug:
             self.save_net_debug_info()
 
         return hpwl
+
+    def _estimate_logic_depth_from_data(self, site_connectivity):
+        """Estimate logic depth from pre-collected connectivity data (single-pass)."""
+        try:
+            if not site_connectivity:
+                self.logic_depth = 1.0
+                return
+
+            avg_connectivity = sum(site_connectivity.values()) / len(site_connectivity)
+            total_sites = len(site_connectivity)
+
+            depth_factor = avg_connectivity / max(1.0, np.sqrt(total_sites))
+            self.logic_depth = min(2.0, max(0.5, depth_factor / 10.0))
+
+            INFO(f"Estimated logic depth factor: {self.logic_depth:.3f} "
+                 f"(avg_connectivity: {avg_connectivity:.2f}, sites: {total_sites})")
+        except Exception as e:
+            WARNING(f"Failed to estimate logic depth: {e}, using default value 1.0")
+            self.logic_depth = 1.0
+
+    def _calculate_net_degrees_from_data(self, degrees):
+        """Calculate degree stats from pre-collected data (single-pass)."""
+        if not degrees:
+            self.max_degree = 0
+            self.avg_degree = 0.0
+        else:
+            self.max_degree = max(degrees)
+            self.avg_degree = sum(degrees) / len(degrees)
     
     def get_net_degrees(self) -> tuple[int, float]:
         return self.max_degree, self.avg_degree
@@ -245,7 +352,15 @@ class NetManager:
         valid_net_num = 0
         connectivity_groups: List[Tuple[Set[str], Set[str]]] = []
 
-        for net in self.nets:
+        # Pre-build lookup sets for O(1) site classification
+        logic_name_set = set(logic_instances.name_to_id.keys())
+        io_name_set = set(io_instances.name_to_id.keys())
+        # Use defaultdict for site_to_nets to avoid repeated membership tests
+        self.site_to_nets = defaultdict(list)
+
+        total_nets = len(self.nets)
+
+        for idx, net in enumerate(self.nets):
             net_name = net.getName()
             if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
                 continue
@@ -261,27 +376,27 @@ class NetManager:
                 site_name = site_inst.getName()
 
                 sites_in_net.add(site_name)
-
-                if logic_instances.has_name(site_name):
+                if site_name in logic_name_set:
                     logic_sites.add(site_name)
-                elif io_instances.has_name(site_name):
+                elif site_name in io_name_set:
                     io_sites.add(site_name)
 
             if len(logic_sites) + len(io_sites) >= 2:
                 self.net_to_sites[net_name] = list(logic_sites) + list(io_sites)
 
+                # Record site-to-net mapping
                 for site_name in sites_in_net:
-                    if site_name not in self.site_to_nets:
-                        self.site_to_nets[site_name] = []
                     self.site_to_nets[site_name].append(net_name)
+
                 connectivity_groups.append((logic_sites, io_sites))
-            else:
-                # WARNING(f'Net {net_name} skipped, logic: {logic_sites}, io: {io_sites}')
-                pass
 
             if len(logic_sites) >= 2:
                 valid_net_num += 1
                 sites_net_list.append(logic_sites)
+
+            # Progress indicator for large designs
+            if total_nets > 100000 and (idx + 1) % 50000 == 0:
+                INFO(f"  Net analysis progress: {idx+1}/{total_nets} ({100*(idx+1)//total_nets}%)")
 
         for logic_sites, io_sites in connectivity_groups:
             self._record_connectivity(logic_sites, io_sites)
@@ -349,49 +464,48 @@ class NetManager:
             io_increment = 1.0
             logic_increment = 1.0
 
-        # 1. IO to logic
+        # 1. IO to logic — preserves original nested-loop structure exactly
+        io_conn = self.io_to_site_connectivity
         for i in range(len(io_inst_list)):
             for j in range(len(logic_inst_list)):
                 io_inst1, inst2 = io_inst_list[i], logic_inst_list[j]
 
-                if io_inst1 not in self.io_to_site_connectivity:
-                    self.io_to_site_connectivity[io_inst1] = {}
-                if inst2 not in self.io_to_site_connectivity[io_inst1]:
-                    self.io_to_site_connectivity[io_inst1][inst2] = 0
-                self.io_to_site_connectivity[io_inst1][inst2] += io_increment
+                if io_inst1 not in io_conn:
+                    io_conn[io_inst1] = {}
+                if inst2 not in io_conn[io_inst1]:
+                    io_conn[io_inst1][inst2] = 0
+                io_conn[io_inst1][inst2] += io_increment
 
-                if inst2 not in self.io_to_site_connectivity:
-                    self.io_to_site_connectivity[inst2] = {}
-                if io_inst1 not in self.io_to_site_connectivity[inst2]:
-                    self.io_to_site_connectivity[inst2][io_inst1] = 0
-                self.io_to_site_connectivity[inst2][io_inst1] += io_increment
+                if inst2 not in io_conn:
+                    io_conn[inst2] = {}
+                if io_inst1 not in io_conn[inst2]:
+                    io_conn[inst2][io_inst1] = 0
+                io_conn[inst2][io_inst1] += io_increment
 
-
-        # 2. Logic to logic
+        # 2. Logic to logic — preserves original nested-loop structure exactly
+        site_conn = self.site_to_site_connectivity
         for i in range(len(logic_inst_list)):
             for j in range(i + 1, len(logic_inst_list)):
                 inst1, inst2 = logic_inst_list[i], logic_inst_list[j]
 
-                if inst1 not in self.site_to_site_connectivity:
-                    self.site_to_site_connectivity[inst1] = {}
-                if inst2 not in self.site_to_site_connectivity[inst1]:
-                    self.site_to_site_connectivity[inst1][inst2] = 0
-                self.site_to_site_connectivity[inst1][inst2] += logic_increment
+                if inst1 not in site_conn:
+                    site_conn[inst1] = {}
+                if inst2 not in site_conn[inst1]:
+                    site_conn[inst1][inst2] = 0
+                site_conn[inst1][inst2] += logic_increment
 
-                if inst2 not in self.site_to_site_connectivity:
-                    self.site_to_site_connectivity[inst2] = {}
-                if inst1 not in self.site_to_site_connectivity[inst2]:
-                    self.site_to_site_connectivity[inst2][inst1] = 0
-                self.site_to_site_connectivity[inst2][inst1] += logic_increment
+                if inst2 not in site_conn:
+                    site_conn[inst2] = {}
+                if inst1 not in site_conn[inst2]:
+                    site_conn[inst2][inst1] = 0
+                site_conn[inst2][inst1] += logic_increment
 
     def _create_net_tensor(self, valid_net_num, sites_net_list, logic_insts_num):
         self.net_tensor = torch.zeros(valid_net_num, logic_insts_num, dtype=torch.bool)
 
         for net_idx, sites in enumerate(sites_net_list):
-            site_idx = []
             for site_name in sites:
                 instance_idx = self.get_site_inst_id_by_name_func(site_name)
-                site_idx.append(instance_idx)
                 self.net_tensor[net_idx, instance_idx] = True
 
         INFO(f"Net tensor shape {self.net_tensor.shape[0]} x {self.net_tensor.shape[1]}")
@@ -399,19 +513,35 @@ class NetManager:
     def _create_net_matrix(self, logic_insts_num, io_insts_num):
         n = logic_insts_num
         k = io_insts_num
+
+        # ---- Pre-build name→id lookup dict (avoids repeated method calls) ----
+        name_to_id = {}
+        get_id = self.get_site_inst_id_by_name_func  # local alias
+
+        # Collect all unique site names from both connectivity dicts
+        all_sites = set(self.site_to_site_connectivity.keys())
+        all_sites.update(self.io_to_site_connectivity.keys())
+        for conn_dict in self.site_to_site_connectivity.values():
+            all_sites.update(conn_dict.keys())
+        for conn_dict in self.io_to_site_connectivity.values():
+            all_sites.update(conn_dict.keys())
+
+        for site_name in all_sites:
+            sid = get_id(site_name)
+            if sid is not None:
+                name_to_id[site_name] = sid
+
+        # ---- Logic matrix (site_to_site_connectivity) ----
         self.insts_matrix = torch.zeros((n, n), device=self.device)
 
         for source_site, connections in self.site_to_site_connectivity.items():
-            source_id = self.get_site_inst_id_by_name_func(source_site)
-            if source_id is not None:
-                for target_site, connection_count in connections.items():
-                    target_id = self.get_site_inst_id_by_name_func(target_site)
-                    if target_id is not None:
-                        self.insts_matrix[source_id, target_id] += connection_count
-                    else:
-                        ERROR(f'Cannot find site target id {target_id}')
-            else:
-                ERROR(f'Cannot find site source id {source_site}')
+            source_id = name_to_id.get(source_site)
+            if source_id is None:
+                continue
+            for target_site, connection_count in connections.items():
+                target_id = name_to_id.get(target_site)
+                if target_id is not None:
+                    self.insts_matrix[source_id, target_id] += connection_count
 
         if self.map_mode == 'simple':
             max_val = torch.max(self.insts_matrix)
@@ -422,25 +552,19 @@ class NetManager:
             denom = float(self.insts_matrix.shape[1]) ** 0.5
             self.insts_matrix = self.insts_matrix / denom
 
-        # max_val = torch.max(self.insts_matrix)
-        # self.insts_matrix = self.insts_matrix * 10 / (max_val)
-
+        # ---- IO matrix (io_to_site_connectivity) ----
         self.io_insts_matrix_all = torch.zeros((n + k, n + k), device=self.device)
 
         for source_site, connections in self.io_to_site_connectivity.items():
-            source_id = self.get_site_inst_id_by_name_func(source_site)
-            if source_id is not None:
-                for target_site, connection_count in connections.items():
-                    target_id = self.get_site_inst_id_by_name_func(target_site)
-                    if target_id is not None:
-                        self.io_insts_matrix_all[source_id, target_id] += connection_count
-                        # INFO(f'Connecting IO {source_site} (id {source_id}) to site {target_site} (id {target_id}), count {connection_count}')
-                    else:
-                        ERROR(f'Cannot find site target id {target_id}')
-            else:
-                ERROR(f'Cannot find site source id {source_site}')
+            source_id = name_to_id.get(source_site)
+            if source_id is None:
+                continue
+            for target_site, connection_count in connections.items():
+                target_id = name_to_id.get(target_site)
+                if target_id is not None:
+                    self.io_insts_matrix_all[source_id, target_id] += connection_count
 
-        self.io_insts_matrix =  self.io_insts_matrix_all[0:n, n:n+k]
+        self.io_insts_matrix = self.io_insts_matrix_all[0:n, n:n+k]
 
         if self.map_mode == 'simple':
             max_val_io = torch.max(self.io_insts_matrix)
