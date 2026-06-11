@@ -4,6 +4,7 @@ from math import log
 from typing import Tuple
 from .objectives import *
 from fem_placer.config import PlaceType, GridType
+from fem_placer.logger import INFO
 
 def entropy_q(p):
     """
@@ -230,6 +231,14 @@ class FPGAPlacementOptimizer:
         h = self._initialize()
         opt = self._setup_optimizer([h])
 
+        # CUDA memory tracking
+        cuda_available = self.dev != 'cpu' and torch.cuda.is_available()
+        mem_log = []
+        if cuda_available:
+            torch.cuda.reset_peak_memory_stats()
+            mem_initial = torch.cuda.memory_allocated()
+            INFO(f"CUDA memory before optimization: {mem_initial / 1024**2:.2f} MB")
+
         for step in range(self.num_steps):
             p = torch.softmax(h, dim=2)
             opt.zero_grad()
@@ -247,11 +256,30 @@ class FPGAPlacementOptimizer:
             free_energy.backward(gradient=torch.ones_like(free_energy))
             opt.step()
 
+            if cuda_available:
+                mem_log.append(torch.cuda.memory_allocated())
+
+        if cuda_available and mem_log:
+            mem_tensor = torch.tensor(mem_log, device='cpu', dtype=torch.float64)
+            mem_avg = mem_tensor.mean().item()
+            mem_max = torch.cuda.max_memory_allocated()
+            INFO(f"CUDA memory report — max: {mem_max / 1024**2:.2f} MB, "
+                 f"avg: {mem_avg / 1024**2:.2f} MB, "
+                 f"peak over initial: {(mem_max - mem_initial) / 1024**2:.2f} MB")
+
         return p
     
     def iterate_placement_with_io(self):
         h_logic, h_io = self._initialize()
         opt = self._setup_optimizer([h_logic, h_io])
+
+        # CUDA memory tracking
+        cuda_available = self.dev != 'cpu' and torch.cuda.is_available()
+        mem_log = []
+        if cuda_available:
+            torch.cuda.reset_peak_memory_stats()
+            mem_initial = torch.cuda.memory_allocated()
+            INFO(f"CUDA memory before optimization: {mem_initial / 1024**2:.2f} MB")
 
         for step in range(self.num_steps):
             p_logic = torch.softmax(h_logic, dim=2)
@@ -272,6 +300,17 @@ class FPGAPlacementOptimizer:
             free_energy = loss - ((entropy_q(p_logic) + entropy_q(p_io)) / self.betas[step])
             free_energy.backward(gradient=torch.ones_like(free_energy))
             opt.step()
+
+            if cuda_available:
+                mem_log.append(torch.cuda.memory_allocated())
+
+        if cuda_available and mem_log:
+            mem_tensor = torch.tensor(mem_log, device='cpu', dtype=torch.float64)
+            mem_avg = mem_tensor.mean().item()
+            mem_max = torch.cuda.max_memory_allocated()
+            INFO(f"CUDA memory report (with IO) — max: {mem_max / 1024**2:.2f} MB, "
+                 f"avg: {mem_avg / 1024**2:.2f} MB, "
+                 f"peak over initial: {(mem_max - mem_initial) / 1024**2:.2f} MB")
 
         return p_logic, p_io
 
