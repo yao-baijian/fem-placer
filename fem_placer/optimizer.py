@@ -1,15 +1,15 @@
 import torch
 import json
 from math import log
-from typing import Tuple
+from typing import Dict, List, Tuple, Optional
 from .objectives import *
 from fem_placer.config import PlaceType, GridType
 from fem_placer.logger import INFO
 
+
 def entropy_q(p):
     """
     Calculate entropy for q-dimensional probability distributions.
-    NOTE: Matches master branch exactly - no epsilon added.
 
     Args:
         p: Probabilities [batch, N, q]
@@ -20,27 +20,44 @@ def entropy_q(p):
     return -(p * torch.log(p)).sum(2).sum(1)
 
 
+def _build_region_distances(
+    region_site_coords: Dict[str, torch.Tensor],
+    distance_metric: str = 'manhattan',
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Build distance matrices for all region pairs."""
+    dists: Dict[str, Dict[str, torch.Tensor]] = {}
+    for rA, coordsA in region_site_coords.items():
+        dists[rA] = {}
+        for rB, coordsB in region_site_coords.items():
+            xi = coordsA[:, 0].unsqueeze(1)
+            xj = coordsB[:, 0].unsqueeze(0)
+            yi = coordsA[:, 1].unsqueeze(1)
+            yj = coordsB[:, 1].unsqueeze(0)
+            d = torch.abs(xi - xj) + torch.abs(yi - yj)
+            if distance_metric == 'sqrt_manhattan':
+                d = torch.sqrt(d)
+            dists[rA][rB] = d
+    return dists
+
+
 class FPGAPlacementOptimizer:
     """
     FPGA Placement optimizer using QUBO formulation with site coordinates.
 
-    This matches the algorithm from the master branch, using pre-computed
-    site coordinate matrices for HPWL calculation.
-
+    Supports N regions (logic, io, dsp, clock, ...) via dict-based
+    configuration.  Coefficients and noise factors are given as lists
+    that map positionally to ``regions``.
     """
 
     def __init__(
             self,
-            num_inst: int,
-            num_fixed_inst: int,
-            num_site: int,
-            num_fixed_site: int,
-            coupling_matrix: torch.Tensor,
-            site_coords_matrix: torch.Tensor,
-            io_site_connect_matrix: torch.Tensor = None,
-            io_site_coords: torch.Tensor = None,
-            constraint_alpha: float = 1.0,
-            constraint_beta: float = 1.0,
+            regions: List[str],
+            region_sizes: Dict[str, Tuple[int, int]],
+            region_coupling: Dict[str, Dict[str, torch.Tensor]],
+            region_site_coords: Dict[str, torch.Tensor],
+            constraint_coeffs: Optional[List[float]] = None,
+            h_factors: Optional[List[float]] = None,
+            # --- Shared params ---
             num_trials: int = 10,
             num_steps: int = 1000,
             dev: str = 'cpu',
@@ -49,114 +66,107 @@ class FPGAPlacementOptimizer:
             anneal: str = 'inverse',
             optimizer: str = 'adam',
             learning_rate: float = 0.1,
-            h_factor: float = 0.01,
-            io_factor: float = 1.0,
             seed: int = 1,
             dtype: torch.dtype = torch.float32,
-            with_io: bool = False,
             manual_grad: bool = False,
             distance_metric: str = 'manhattan',
         ):
-        """
-        Initialize the FPGA placement optimizer with QUBO formulation.
+        self.regions = list(regions)
+        self.region_sizes = region_sizes
+        self.region_coupling = region_coupling
+        self.region_site_coords = region_site_coords
 
-        Args:
-            num_inst: Number of instances to place
-            num_site: Number of available placement sites
-            coupling_matrix: Instance connectivity matrix [num_inst, num_inst]
-            site_coords_matrix: Site coordinates [num_site, 2]
-            drawer: Optional PlacementDrawer for visualization
-            visualization_steps: Steps at which to visualize
-            constraint_alpha: Weight for constraint loss (alpha parameter)
-        """
-        self.num_inst = num_inst
-        self.fixed_insts_num = num_fixed_inst
-        self.num_site = num_site
-        self.fixed_site_num = num_fixed_site
-        self.coupling_matrix = coupling_matrix
-        self.logic_site_coords = site_coords_matrix
-        self.io_site_connect_matrix = io_site_connect_matrix
-        self.io_site_coords = io_site_coords
-        self.constraint_alpha = constraint_alpha
-        self.constraint_beta = constraint_beta
-        
+        # Convert positional lists to region-keyed dicts
+        if constraint_coeffs is not None:
+            self.constraint_coeffs = dict(zip(self.regions, constraint_coeffs))
+        else:
+            self.constraint_coeffs = {r: 1.0 for r in self.regions}
+
+        if h_factors is not None:
+            self.h_factors = dict(zip(self.regions, h_factors))
+        else:
+            self.h_factors = {r: 0.01 for r in self.regions}
+
         self.num_trials = num_trials
         self.num_steps = num_steps
         self.dev = dev
         self.dtype = dtype
+        self.seed = seed
+        self.manual_grad = manual_grad
+        self.distance_metric = distance_metric.lower()
+        if self.distance_metric not in ('manhattan', 'sqrt_manhattan'):
+            raise ValueError("distance_metric must be 'manhattan' or 'sqrt_manhattan'")
 
+        # --- Annealing schedule ---
         if anneal == 'lin':
             betas = torch.linspace(betamin, betamax, num_steps)
         elif anneal == 'exp':
-            betas = torch.exp(torch.linspace(log(betamin), log(betamax),num_steps))
+            betas = torch.exp(torch.linspace(log(betamin), log(betamax), num_steps))
         elif anneal == 'inverse':
             betas = 1 / torch.linspace(betamax, betamin, num_steps)
-        self.betas = betas.to(self.dtype).to(self.dev) 
-        
+        self.betas = betas.to(self.dtype).to(self.dev)
+
         self.optimizer = optimizer
         self.learning_rate = learning_rate
-        self.h_factor = h_factor
-        self.io_factor = io_factor
-        self.seed = seed
-        self.with_io = with_io
-        self.manual_grad = manual_grad
-        metric = distance_metric.lower()
-        if metric not in ('manhattan', 'sqrt_manhattan'):
-            raise ValueError("distance_metric must be either 'manhattan' or 'sqrt_manhattan'")
-        self.distance_metric = metric
 
-        self.D = None
-
-        self.D_LL = None
-        self.D_LI = None
+        # --- Distance matrices (built on first use) ---
+        self._region_distances: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
 
     @classmethod
     def from_saved_params(cls, params_file: str, **kwargs):
         """
         Create an FPGAPlacementOptimizer from saved parameters in a JSON file.
-        
+
         Args:
             params_file: Path to the JSON file containing saved parameters
             **kwargs: Additional arguments to override saved parameters
-                      (e.g., num_trials, num_steps, dev, etc.)
-        
+
         Returns:
             FPGAPlacementOptimizer instance
         """
         with open(params_file, 'r') as f:
             data = json.load(f)
-        
+
         params = data['params']
         tensors = data['tensors']
-        
+
         target_dev = kwargs.get('dev', params.get('device', 'cpu'))
+
+        # Rebuild N-region dicts from the saved legacy scalars
         coupling_matrix = torch.tensor(tensors['coupling_matrix'], dtype=torch.float32, device=target_dev) if 'coupling_matrix' in tensors else None
         site_coords_matrix = torch.tensor(tensors['site_coords_matrix'], dtype=torch.float32, device=target_dev) if 'site_coords_matrix' in tensors else None
         io_site_connect_matrix = torch.tensor(tensors['io_site_connect_matrix'], dtype=torch.float32, device=target_dev) if 'io_site_connect_matrix' in tensors else None
         io_site_coords = torch.tensor(tensors['io_site_coords'], dtype=torch.float32, device=target_dev) if 'io_site_coords' in tensors else None
-        
-        place_orientation = PlaceType[params['place_orientation']] if params['place_orientation'] in PlaceType.__members__ else PlaceType.CENTERED
-        grid_type = GridType[params['grid_type']] if params['grid_type'] in GridType.__members__ else GridType.SQUARE
-        
-        default_kwargs = {
-            'num_inst': params['num_inst'],
-            'num_fixed_inst': params['num_fixed_inst'],
-            'num_site': params['num_site'],
-            'num_fixed_site': params['num_fixed_site'],
-            'coupling_matrix': coupling_matrix,
-            'site_coords_matrix': site_coords_matrix,
-            'io_site_connect_matrix': io_site_connect_matrix,
-            'io_site_coords': io_site_coords,
-            'constraint_alpha': params['constraint_alpha'],
-            'constraint_beta': params['constraint_beta'],
-            'dev': target_dev,
-            'dtype': torch.float32,
-            'with_io': params['with_io'],
-            'distance_metric': params.get('distance_metric', 'manhattan'),
-        }
-        
+
+        regions = ['logic']
+        region_sizes = {'logic': (params['num_inst'], params['num_site'])}
+        region_coupling = {'logic': {'logic': coupling_matrix}}
+        region_site_coords = {'logic': site_coords_matrix}
+        constraint_coeffs = [params.get('constraint_alpha', 1.0)]
+        h_factors = [params.get('h_factor', 0.01)]
+
+        if params.get('with_io', False) and io_site_coords is not None and io_site_connect_matrix is not None:
+            regions.append('io')
+            region_sizes['io'] = (params.get('num_fixed_inst', 0), params.get('num_fixed_site', 0))
+            region_coupling['logic']['io'] = io_site_connect_matrix
+            region_coupling['io'] = {'logic': io_site_connect_matrix.T.clone()}
+            region_coupling['io']['io'] = None
+            region_site_coords['io'] = io_site_coords
+            constraint_coeffs.append(params.get('constraint_beta', 0.0))
+            h_factors.append(params.get('io_factor', 1.0) * params.get('h_factor', 0.01))
+
+        default_kwargs = dict(
+            regions=regions,
+            region_sizes=region_sizes,
+            region_coupling=region_coupling,
+            region_site_coords=region_site_coords,
+            constraint_coeffs=constraint_coeffs,
+            h_factors=h_factors,
+            dev=target_dev,
+            dtype=torch.float32,
+            distance_metric=params.get('distance_metric', 'manhattan'),
+        )
         default_kwargs.update(kwargs)
-        
         return cls(**default_kwargs)
 
     def _apply_distance_metric(self, distance_tensor: torch.Tensor) -> torch.Tensor:
@@ -165,55 +175,36 @@ class FPGAPlacementOptimizer:
             return torch.sqrt(distance_tensor)
         return distance_tensor
 
+    def _ensure_distances(self):
+        """Build distance matrices if not already built."""
+        if self._region_distances is None:
+            self._region_distances = _build_region_distances(
+                self.region_site_coords, self.distance_metric,
+            )
+
     def _initialize(self):
+        """
+        Initialise random latent variables h_r for every region,
+        and pre-compute all distance matrices.
 
+        Returns:
+            Dict[r] → h tensor [num_trials, N_r, M_r]
+        """
         torch.manual_seed(self.seed)
-        
-        if self.with_io:
-            h_logic = self.h_factor * torch.randn(
-                [self.num_trials, self.num_inst, self.num_site], 
-                device=self.dev, dtype=self.dtype
-            )
-            
-            h_io = self.io_factor * self.h_factor * torch.randn(
-                [self.num_trials, self.fixed_insts_num, self.fixed_site_num], 
-                device=self.dev, dtype=self.dtype
-            )
+        self._ensure_distances()
 
+        hs = {}
+        for r in self.regions:
+            n_inst, n_site = self.region_sizes[r]
+            h = self.h_factors[r] * torch.randn(
+                [self.num_trials, n_inst, n_site],
+                device=self.dev, dtype=self.dtype,
+            )
             if not self.manual_grad:
-                h_logic.requires_grad=True
-                h_io.requires_grad=True
+                h.requires_grad = True
+            hs[r] = h
 
-            x_logic = self.logic_site_coords[:, 0]
-            y_logic = self.logic_site_coords[:, 1]
-
-            Dx_LL = torch.abs(x_logic.unsqueeze(1) - x_logic.unsqueeze(0))
-            Dy_LL = torch.abs(y_logic.unsqueeze(1) - y_logic.unsqueeze(0))
-            self.D_LL = self._apply_distance_metric(Dx_LL + Dy_LL)
-
-            x_io = self.io_site_coords[:, 0]
-            y_io = self.io_site_coords[:, 1]
-
-            Dx_LI = torch.abs(x_logic.unsqueeze(1) - x_io.unsqueeze(0))
-            Dy_LI = torch.abs(y_logic.unsqueeze(1) - y_io.unsqueeze(0))
-            self.D_LI = self._apply_distance_metric(Dx_LI + Dy_LI)
-
-            return h_logic, h_io
-
-        h = self.h_factor * torch.randn(
-            [self.num_trials, self.num_inst, self.num_site],
-            device=self.dev, dtype=self.dtype
-        )
-
-        if not self.manual_grad:
-            h.requires_grad = True
-
-        coords_i = self.logic_site_coords.unsqueeze(1)
-        coords_j = self.logic_site_coords.unsqueeze(0)
-        base_distance = torch.sum(torch.abs(coords_i - coords_j), dim=2)
-        self.D = self._apply_distance_metric(base_distance)
-
-        return h
+        return hs
 
     def _setup_optimizer(self, params):
         """Set up the torch optimizer."""
@@ -228,8 +219,14 @@ class FPGAPlacementOptimizer:
             raise ValueError("Unknown optimizer, valid choices are ['adam', 'rmsprop'].")
 
     def iterate_placement(self):
-        h = self._initialize()
-        opt = self._setup_optimizer([h])
+        """
+        Run the full optimisation loop over N regions.
+
+        Returns:
+            Dict[r] → softmax probability tensor [num_trials, N_r, M_r]
+        """
+        hs = self._initialize()
+        opt = self._setup_optimizer(list(hs.values()))
 
         # CUDA memory tracking
         cuda_available = self.dev != 'cpu' and torch.cuda.is_available()
@@ -240,19 +237,18 @@ class FPGAPlacementOptimizer:
             INFO(f"CUDA memory before optimization: {mem_initial / 1024**2:.2f} MB")
 
         for step in range(self.num_steps):
-            p = torch.softmax(h, dim=2)
+            ps = {r: torch.softmax(hs[r], dim=2) for r in self.regions}
             opt.zero_grad()
 
-            loss = expected_fpga_placement(
-                J=self.coupling_matrix, 
-                p=p, 
-                D=self.D, 
-                step=step, 
-                site_coords_matrix=self.logic_site_coords, 
-                alpha=self.constraint_alpha
+            loss = expected_fpga_placement_with_regions(
+                region_ps=ps,
+                region_coupling=self.region_coupling,
+                region_distances=self._region_distances,
+                alphas=self.constraint_coeffs,
             )
 
-            free_energy = loss - entropy_q(p) / self.betas[step]
+            total_entropy = sum(entropy_q(ps[r]) for r in self.regions)
+            free_energy = loss - total_entropy / self.betas[step]
             free_energy.backward(gradient=torch.ones_like(free_energy))
             opt.step()
 
@@ -267,68 +263,22 @@ class FPGAPlacementOptimizer:
                  f"avg: {mem_avg / 1024**2:.2f} MB, "
                  f"peak over initial: {(mem_max - mem_initial) / 1024**2:.2f} MB")
 
-        return p
-    
-    def iterate_placement_with_io(self):
-        h_logic, h_io = self._initialize()
-        opt = self._setup_optimizer([h_logic, h_io])
+        return ps
 
-        # CUDA memory tracking
-        cuda_available = self.dev != 'cpu' and torch.cuda.is_available()
-        mem_log = []
-        if cuda_available:
-            torch.cuda.reset_peak_memory_stats()
-            mem_initial = torch.cuda.memory_allocated()
-            INFO(f"CUDA memory before optimization: {mem_initial / 1024**2:.2f} MB")
+    def optimize(self):
+        """
+        Run optimisation and infer final placements.
 
-        for step in range(self.num_steps):
-            p_logic = torch.softmax(h_logic, dim=2)
-            p_io = torch.softmax(h_io, dim=2)
-            opt.zero_grad()
-
-            loss = expected_fpga_placement_with_io(
-                J_LL=self.coupling_matrix, 
-                J_LI=self.io_site_connect_matrix, 
-                p_logic=p_logic, 
-                p_io=p_io, 
-                D_LL=self.D_LL, 
-                D_LI=self.D_LI, 
-                alpha=self.constraint_alpha, 
-                beta=self.constraint_beta
-            )
-
-            free_energy = loss - ((entropy_q(p_logic) + entropy_q(p_io)) / self.betas[step])
-            free_energy.backward(gradient=torch.ones_like(free_energy))
-            opt.step()
-
-            if cuda_available:
-                mem_log.append(torch.cuda.memory_allocated())
-
-        if cuda_available and mem_log:
-            mem_tensor = torch.tensor(mem_log, device='cpu', dtype=torch.float64)
-            mem_avg = mem_tensor.mean().item()
-            mem_max = torch.cuda.max_memory_allocated()
-            INFO(f"CUDA memory report (with IO) — max: {mem_max / 1024**2:.2f} MB, "
-                 f"avg: {mem_avg / 1024**2:.2f} MB, "
-                 f"peak over initial: {(mem_max - mem_initial) / 1024**2:.2f} MB")
-
-        return p_logic, p_io
-
-    def optimize(self) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        if self.with_io:
-            p = self.iterate_placement_with_io()
-            config, result = infer_placements_with_io(self.coupling_matrix, 
-                                                      self.io_site_connect_matrix,
-                                                      p[0], p[1], 
-                                                      self.logic_site_coords,
-                                                      D_LL=self.D_LL, D_LI=self.D_LI, 
-                                                      io_site_coords=self.io_site_coords)
-            return config, result
-        else:
-            p = self.iterate_placement()
-            config, result = infer_placements(self.coupling_matrix, 
-                                              p, 
-                                              self.logic_site_coords, 
-                                              D=self.D)
-            return config, result
+        Returns:
+            (config, result) where
+              config is a Dict[r] → instance coords [num_trials, N_r, 2]
+              result is HPWL values [num_trials]
+        """
+        ps = self.iterate_placement()
+        config, result = infer_placements_with_regions(
+            region_ps=ps,
+            region_site_coords=self.region_site_coords,
+            region_coupling=self.region_coupling,
+            region_distances=self._region_distances,
+        )
+        return config, result

@@ -1,4 +1,6 @@
 import sys
+import os
+
 
 class Logger:
     _instance = None
@@ -19,6 +21,7 @@ class Logger:
         self._set_level(level)
         self.show_class_name = show_class_name
         self.enabled = True
+        self._log_file = None
     
     @classmethod
     def get_instance(cls):
@@ -26,6 +29,22 @@ class Logger:
             cls._instance = Logger()
         return cls._instance
     
+    def set_log_file(self, path: str):
+        """Write all future log output to *path* in addition to stdout."""
+        self._log_file = path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Write a header
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(f"=== FEM Placer Log ===\n")
+    
+    def _write_file(self, formatted: str):
+        if self._log_file:
+            try:
+                with open(self._log_file, 'a', encoding='utf-8') as f:
+                    f.write(formatted + '\n')
+            except Exception:
+                pass
+
     def _set_level(self, level: str):
         level = level.upper()
         if level in self._log_levels:
@@ -63,7 +82,9 @@ class Logger:
     
     def log(self, message: str, level: str = 'INFO'):
         if self._should_log(level):
-            print(self._format_message(message, level))
+            formatted = self._format_message(message, level)
+            print(formatted)
+            self._write_file(formatted)
     
     def error(self, message: str):
         self.log(message, 'ERROR')

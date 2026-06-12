@@ -10,14 +10,9 @@ from .drawer import PlacementDrawer
 from .legalizer import Legalizer
 from .router import Router
 from .optimizer import FPGAPlacementOptimizer
-from .timer import Timer
-from .timing_analyzer import (
-    TimingAnalyzer,
-    TimingSummary,
-    analyze_placement_timing,
-    parse_vivado_timing,
-    generate_vivado_timing_tcl,
-)
+from .timer import Timer, TimingAnalyzer, TimingSummary, analyze_placement_timing, analyze_path_based_timing, parse_vivado_timing
+from .vivado_timer import VivadoTimingRunner, generate_vivado_timing_tcl
+from .rapidwright_timer import RapidWrightTimer
 
 # QUBO approach (site_coords_matrix based)
 from .objectives import (
@@ -56,8 +51,10 @@ __all__ = [
     'TimingAnalyzer',
     'TimingSummary',
     'analyze_placement_timing',
+    'analyze_path_based_timing',
     'parse_vivado_timing',
     'generate_vivado_timing_tcl',
+    'VivadoTimingRunner',
 
     # QUBO functions
     'get_site_distance_matrix',

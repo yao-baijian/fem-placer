@@ -1,7 +1,13 @@
+
 """
 Test script for FPGA placement optimizer using QUBO formulation.
 
-This script tests the FPGAPlacementOptimizer on a real FPGA design.
+Usage::
+
+    cfg = TestConfig.load()
+    placer = FpgaPlacer(cfg)
+    placer.set_instance_name('s15850')
+    ...
 """
 
 import sys
@@ -15,251 +21,151 @@ warnings.filterwarnings("ignore", message="Trying to unpickle estimator.*")
 from fem_placer import (
     FpgaPlacer,
     PlacementDrawer,
-    Legalizer,
     Router,
+    Legalizer,
     FPGAPlacementOptimizer,
-    TimingAnalyzer,
-    analyze_placement_timing,
-    parse_vivado_timing,
 )
 from fem_placer.logger import *
-from fem_placer.config import *
-from ml.dataset import *
+from tests.utils import (
+    TestConfig,
+    get_vivado_place_times,
+    run_timing_analysis,
+    RESULT_HEADER,
+    format_result_row,
+)
+from ml.dataset import extract_features_from_placer
 from ml.predict import predict_alpha
-import glob
-import re
+import json
 import os
 
-def get_vivado_place_times(logs_dir='./vivado/output_dir'):
-    vivado_times = {}
-    
-    if not os.path.exists(logs_dir):
-        return vivado_times
-        
-    for instance_dir in os.listdir(logs_dir):
-        place_time_file = os.path.join(logs_dir, instance_dir, 'place_time.txt')
-        if os.path.isfile(place_time_file):
-            try:
-                with open(place_time_file, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if content:
-                        vivado_times[instance_dir] = int(float(content))
-            except Exception as e:
-                print(f"Error reading {place_time_file}: {e}")
-                
-    return vivado_times
+cfg = TestConfig.load()
+SET_LEVEL("INFO")
+
+# Setup per-instance log file
+def _setup_log(instance: str):
+    log_dir = f'result/{instance}'
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, 'run.log')
+    Logger.get_instance().set_log_file(log_path)
+    INFO(f"Config: {json.dumps({k: str(v) if not isinstance(v, (str, int, float, bool, list)) else v for k, v in cfg.__dict__.items() if not k.startswith('_')}, indent=2)}")
 
 vivado_place_times = get_vivado_place_times()
+print(RESULT_HEADER)
 
-# Timing analysis configuration
-TIMING_CLOCK_PERIOD_NS = 5.0  # 200 MHz target
+for instance in cfg.instances:
+    _setup_log(instance)
+    placer = FpgaPlacer(cfg)
+    placer.set_instance_name(instance)
 
-def get_vivado_timing_metrics(instance_dir='./vivado/output_dir'):
-    """Read Vivado timing metrics if available."""
-    metrics = {}
-    metrics_file = os.path.join(instance_dir, 'timing_metrics.txt')
-    if os.path.isfile(metrics_file):
-        try:
-            with open(metrics_file, 'r') as f:
-                for line in f:
-                    if ':' in line:
-                        key, val = line.split(':', 1)
-                        metrics[key.strip()] = val.strip()
-        except Exception:
-            pass
-    return metrics
+    dcp_path = f"./vivado/output_dir/{instance}/post_impl.dcp"
+    pl_path = f"./vivado/output_dir/{instance}/optimized_placement.pl"
+    vivado_hpwl, inst_num, net_num = placer.init_placement(dcp_path, pl_path)
 
-SET_LEVEL('INFO')
-
-# instances = ['c2670', 'c5315', 'c6288', 'c7552',
-#              's1488', 's5378', 's9234', 's15850', 'bgm', 'sha1', 'RLE_BlobMerging', 'FPGA-example1']
-
-# instances = ['bgm', 'blob_merge', 'boundtop', 'ch_intrinsics', 'diffeq', 'diffeq2', 'LU8PEEng', 
-#             'LU32PEEng', 'mcml', 'mkDelayWorker32B', 'mkPktMerge', 'mkSMAdapter4B', 'or1200', 
-#             'raygentop', 'sha', 'stereovision0', 'stereovision1', 'stereovision2', 'stereovision3', 'RLE_BlobMerging']
-
-# instances = ['c2670_boundary', 'c5315_boundary', 'c6288_boundary', 'c7552_boundary',
-#              's1488_boundary', 's5378_boundary', 's9234_boundary', 's15850_boundary', 'FPGA-example1_boundary']
-
-# instances = ['c2670_boundary']
-
-instances = ['FPGA-example2']
-
-# 'bgm_boundary', 'RLE_BlobMerging_boundary', 'sha1_boundary'
-
-# instances = ['bgm', 'sha1', 'RLE_BlobMerging']
-            
-draw_evolution = False
-draw_loss_function = False
-draw_final_placement = False
-num_trials = 5
-num_steps = 500
-dev = 'cuda'
-manual_grad = False
-anneal='exp'
-io_factor = 1
-
-print(f"{'Benchmarks':<12} {'Instance':<10} {'Inst':<6} {'IO Inst':<6} {'Net/Total':<14} {'Overlap':<8} "
-    f"{'Alpha':<8} {'Beta':<8} {'HPWL Init':<18} {'HPWL Final':<16} {'HPWL Vivado':<12} "
-    f"{'Time(s)':<10} {'VivadoT(s)':<10} "
-    f"{'FEM-WNS(ns)':<14} {'FEM-Fmax':<12} {'Vvd-WNS':<12} {'Vvd-Fmax':<12}")
-
-for instance in instances:
-    place_type = PlaceType.CENTERED
-    debug = False
-    fpga_placer = FpgaPlacer(place_orientation = place_type, 
-                            grid_type = GridType.SQUARE,
-                            place_mode = IoMode.NORMAL,
-                            utilization_factor = 0.4,
-                            debug = debug,
-                            device = dev)
-
-    fpga_placer.set_instance_name(instance)
-    
-    vivado_hpwl, inst_num, net_num = fpga_placer.init_placement(f'./vivado/output_dir/{instance}/post_impl.dcp', f'./vivado/output_dir/{instance}/optimized_placement.pl')
     net_ratio = f"{net_num['logic_net_num']}/{net_num['total_net_num']}"
-    global_drawer = PlacementDrawer(placer=fpga_placer)
-    row = extract_features_from_placer(fpga_placer,
-                                       alpha=0, 
-                                       beta=0, 
-                                       with_io=False)
-    
-    alpha = predict_alpha(row)
-    INFO(f'instance {instance}, predicted alpha {alpha}')
-    used_alpha = alpha * 0.001
-    fpga_placer.set_alpha(used_alpha)
+    drawer = PlacementDrawer(placer=placer)
 
-    if place_type == PlaceType.IO:
-        used_beta =alpha * 0.001
-        fpga_placer.set_beta(used_beta)
-    else:
-        used_beta = 0.0
+    # row = extract_features_from_placer(placer, alpha=0, beta=0, with_io=False)
+    # alpha_val = predict_alpha(row) * 0.001
+    alpha_val = 30
+    placer.set_alpha(alpha_val)
+    if "io" in placer.regions:
+        placer.set_beta(30)
 
-    # fpga_placer.set_alpha(30)
-    
+    # Build N-region dicts for the optimizer
+    regions = placer.regions
+    region_sizes = {r: (placer.instances[r].num, placer.get_grid(r).area) for r in regions}
+    region_site_coords = {r: getattr(placer, f'{r}_site_coords') for r in regions}
+    io_mat = placer.net_manager.io_insts_matrix
+    region_coupling = {}
+    for rA in regions:
+        region_coupling[rA] = {}
+        for rB in regions:
+            if rA == rB == 'logic':
+                region_coupling[rA][rB] = placer.net_manager.insts_matrix
+            elif rA == 'logic' and rB == 'io' and io_mat is not None:
+                region_coupling[rA][rB] = io_mat
+            elif rA == 'io' and rB == 'logic' and io_mat is not None:
+                region_coupling[rA][rB] = io_mat.T.clone()
+            else:
+                region_coupling[rA][rB] = None
+
+    # Build coefficient lists that map positionally to regions
+    coeff_map = {'logic': placer.constraint_alpha, 'io': placer.constraint_beta}
+    constraint_coeffs = [coeff_map.get(r, 1.0) for r in regions]
+    h_factors = [cfg.io_factor * cfg.h_factor if r == 'io' else cfg.h_factor for r in regions]
+
     optimizer = FPGAPlacementOptimizer(
-        num_inst=fpga_placer.instances['logic'].num,
-        num_fixed_inst=fpga_placer.instances['io'].num,
-        num_site=fpga_placer.get_grid('logic').area,
-        num_fixed_site=fpga_placer.get_grid('io').area,
-        coupling_matrix=fpga_placer.net_manager.insts_matrix,
-        site_coords_matrix=fpga_placer.logic_site_coords,
-        io_site_connect_matrix=fpga_placer.net_manager.io_insts_matrix,
-        io_site_coords=fpga_placer.io_site_coords,
-        constraint_alpha=fpga_placer.constraint_alpha,
-        constraint_beta=fpga_placer.constraint_beta,  # For IO placements, beta is set separately
-        num_trials=num_trials,
-        num_steps=num_steps,
-        dev=dev,
-        betamin=0.01,
-        betamax=0.5,
-        anneal=anneal,
-        optimizer='adam',
-        learning_rate=0.1,
-        h_factor=0.01,
-        io_factor=io_factor,
-        seed=1,
+        regions=regions,
+        region_sizes=region_sizes,
+        region_coupling=region_coupling,
+        region_site_coords=region_site_coords,
+        constraint_coeffs=constraint_coeffs,
+        h_factors=h_factors,
+        num_trials=cfg.num_trials,
+        num_steps=cfg.num_steps,
+        dev=cfg.dev,
+        betamin=cfg.betamin,
+        betamax=cfg.betamax,
+        anneal=cfg.anneal,
+        optimizer="adam",
+        learning_rate=cfg.learning_rate,
+        seed=cfg.seed,
         dtype=torch.float32,
-        with_io=(place_type == PlaceType.IO),
-        manual_grad=manual_grad
+        manual_grad=cfg.manual_grad,
+        distance_metric='manhattan',
     )
-    
-    start_time = time.time()
+
+    t0 = time.time()
     config, result = optimizer.optimize()
-    end_time = time.time()
-    optimize_time = end_time - start_time
-    
-    optimal_inds = torch.argwhere(result==result.min()).reshape(-1)
-    legalizer = Legalizer(placer=fpga_placer,
-                        device=dev)
-    router = Router(placer=fpga_placer)
-    logic_ids, io_ids = fpga_placer.get_ids()
+    optimize_time = time.time() - t0
 
-    if place_type == PlaceType.IO:
-        # real_logic_coords = fpga_placer.get_grid('logic').to_real_coords_tensor(config[0][optimal_inds[0]])
-        # real_io_coords = fpga_placer.get_grid('io').to_real_coords_tensor(config[1][optimal_inds[0]])
+    optimal_inds = torch.argwhere(result == result.min()).reshape(-1)
+    legalizer = Legalizer(placer=placer, device=cfg.dev)
+    router = Router(placer=placer)
+    logic_ids, io_ids = placer.get_ids()
 
-        real_logic_coords = config[0][optimal_inds[0]]
-        real_io_coords = config[1][optimal_inds[0]]
-        placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(real_logic_coords, logic_ids, real_io_coords, io_ids, include_io = True)
-        all_coords = torch.cat([placement_legalized[0], placement_legalized[1]], dim=0)
-        routes = router.route_connections(fpga_placer.net_manager.insts_matrix, all_coords)
-        vivado_time_str = str(vivado_place_times.get(instance, 'N/A'))
-        
-        # --- Timing Analysis (Framework) ---
-        timing_result = analyze_placement_timing(
-            fpga_placer,
-            placement_legalized[0],
-            placement_legalized[1],
-            include_io=True,
-            clock_period_ns=TIMING_CLOCK_PERIOD_NS,
-        )
-        
-        # --- Timing Analysis (Vivado) ---
-        vivado_timing = get_vivado_timing_metrics(f'./vivado/output_dir/{instance}')
-        vvd_wns = vivado_timing.get('WNS', 'N/A')
-        vvd_fmax = vivado_timing.get('Fmax (MHz)', 'N/A')
-        
-        print(f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} {inst_num['io_inst_num']:<6} {net_ratio:<14} {overlap:<8} "
-            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl']:<18.2f} {fem_hpwl_final['hpwl']:<16.2f} {vivado_hpwl['hpwl']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<10} "
-            f"{timing_result.wns*1e9:<14.3f} {timing_result.fmax:<12.1f} {vvd_wns:<12} {vvd_fmax:<12}")
+    include_io = ("io" in placer.regions)
+    if include_io:
+        real_logic_coords = config['logic'][optimal_inds[0]]
+        real_io_coords = config['io'][optimal_inds[0]]
+        legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(
+            real_logic_coords, logic_ids, real_io_coords, io_ids, include_io=True)
+        all_coords = torch.cat([legalized[0], legalized[1]], dim=0)
+        routes = router.route_connections(placer.net_manager.insts_matrix, all_coords)
     else:
-        real_logic_coords = config[optimal_inds[0]]
-        placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(real_logic_coords, logic_ids)
-        routes = router.route_connections(fpga_placer.net_manager.insts_matrix, (placement_legalized[0]))
-        vivado_time_str = str(vivado_place_times.get(instance, 'N/A'))
-        
-        # --- Timing Analysis (Framework) ---
-        timing_result = analyze_placement_timing(
-            fpga_placer,
-            placement_legalized[0],
-            clock_period_ns=TIMING_CLOCK_PERIOD_NS,
-        )
-        
-        # --- Timing Analysis (Vivado) ---
-        vivado_timing = get_vivado_timing_metrics(f'./vivado/output_dir/{instance}')
-        vvd_wns = vivado_timing.get('WNS', 'N/A')
-        vvd_fmax = vivado_timing.get('Fmax (MHz)', 'N/A')
-        
-        print(f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} {inst_num['io_inst_num']:<6} {net_ratio:<14} {overlap:<8} "
-            f"{used_alpha:<8.2f} {used_beta:<8.2f} {fem_hpwl_initial['hpwl_no_io']:<18.2f} {fem_hpwl_final['hpwl_no_io']:<16.2f} {vivado_hpwl['hpwl_no_io']:<12.2f} {optimize_time:<10.2f} {vivado_time_str:<10} "
-            f"{timing_result.wns*1e9:<14.3f} {timing_result.fmax:<12.1f} {vvd_wns:<12} {vvd_fmax:<12}")
-    
-    # Print detailed timing report
+        real_logic_coords = config['logic'][optimal_inds[0]]
+        legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(
+            real_logic_coords, logic_ids)
+        routes = router.route_connections(placer.net_manager.insts_matrix, legalized[0])
+
+    vivado_time_str = str(vivado_place_times.get(instance, "N/A"))
+
+    timing_result = run_timing_analysis(
+        placer=placer,
+        placement_legalized=legalized,
+        clock_period_ns=cfg.clock_period_ns,
+        use_rapidwright=True,
+        instance_name=instance,
+    )
+
+    print(format_result_row(
+        instance=instance, inst_num=inst_num, net_ratio=net_ratio,
+        overlap=overlap,
+        used_alpha=alpha_val, used_beta=0.0,
+        fem_hpwl_initial=hpwl_i, fem_hpwl_final=hpwl_f,
+        vivado_hpwl=vivado_hpwl,
+        optimize_time=optimize_time, vivado_time_str=vivado_time_str,
+        wns_ns=timing_result.wns * 1e9, fmax_mhz=timing_result.fmax,
+        include_io=include_io,
+    ))
     print()
     print(timing_result.format_report())
     print()
 
-    if draw_loss_function:
-        global_drawer.plot_fpga_placement_loss(f'result/{instance}/hpwl_loss.png')
-
-    if draw_evolution:
-        global_drawer.draw_multi_step_placement(f'result/{instance}/placement_evolution.png')
-
-    if draw_final_placement:
-        include_io = (place_type == PlaceType.IO)
-        io_coords = placement_legalized[1] if include_io else None
-        global_drawer.draw_place_and_route(placement_legalized[0], routes, io_coords, include_io, 1000, title_suffix="Final Placement with Routing")
-
-
-# =============================================================================
-# Example: How to use saved parameters for collaborator without Vivado
-# =============================================================================
-#
-# 1. Save parameters after init_placement (on machine with Vivado):
-#    fpga_placer.save_init_params(instance_name='c7552')
-#    # Output: result/c7552/init_params.json
-#
-# 2. Load parameters and create optimizer (on machine without Vivado):
-#    from fem_placer import FPGAPlacementOptimizer
-#
-#    optimizer = FPGAPlacementOptimizer.from_saved_params(
-#        'result/c7552/init_params.json',
-#        num_trials=10,
-#        num_steps=1000,
-#        dev='cpu'
-#    )
-#
-#    config, result = optimizer.optimize()
-# =============================================================================
-
+    if cfg.draw_loss_function:
+        drawer.plot_fpga_placement_loss(f"result/{instance}/hpwl_loss.png")
+    if cfg.draw_evolution:
+        drawer.draw_multi_step_placement(f"result/{instance}/placement_evolution.png")
+    if cfg.draw_final_placement:
+        io_c = legalized[1] if include_io else None
+        drawer.draw_place_and_route(legalized[0], routes, io_c, include_io, 1000)

@@ -1,27 +1,77 @@
 """
-Timing Analysis for FPGA Placement.
+Timing Analyzer for FPGA Placement.
 
-This module provides timing-aware placement optimization including:
-- Timing path extraction and analysis
-- Timing-weighted HPWL calculation
-- Congestion estimation and awareness
-- Timing closure analysis
+Provides two complementary timing analysis capabilities:
+
+1. **Framework-level timing estimation**: Estimates WNS, TNS, and Fmax from the
+   placement coordinates and netlist topology without requiring Vivado. Uses
+   wirelength-based delay models and logic depth estimation.
+
+2. **Vivado timing report parser**: Parses Vivado timing_summary.rpt files to
+   extract WNS, TNS, and other timing metrics for comparison.
 """
 
+import re
+import os
 import torch
 import numpy as np
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
+from .logger import INFO, WARNING, ERROR
+
+
+# =============================================================================
+# Default technology parameters (7-series / Ultrascale like)
+# These can be overridden via the TimingAnalyzer constructor.
+# Values are representative for a typical 28nm/20nm FPGA process.
+# =============================================================================
+DEFAULT_CELL_DELAYS = {
+    'LUT':      {'min': 50e-12,  'max': 120e-12},   # 50-120 ps
+    'FF':       {'clk2q': 60e-12, 'setup': 40e-12,   'hold': 10e-12},
+    'CARRY':    {'min': 30e-12,  'max': 80e-12},
+    'MUX':      {'min': 40e-12,  'max': 90e-12},
+    'DSP':      {'min': 200e-12, 'max': 500e-12},
+    'BRAM':     {'min': 300e-12, 'max': 600e-12},
+    'IO':       {'min': 100e-12, 'max': 200e-12},
+}
+
+# Wire delay per site pitch (ps per SLICE)
+# For Ultrascale: ~0.2-0.5 ps per site for local routing
+DEFAULT_WIRE_DELAY_PER_SITE = 0.3e-12  # 0.3 ps per site pitch
+
+# Default clock period if none specified (ns)
+DEFAULT_CLOCK_PERIOD = 5.0  # 200 MHz
+
+# =============================================================================
+# Cell type classification helpers
+# =============================================================================
+# FF cell type prefixes (sequential elements)
+FF_TYPE_PREFIXES = ('FD', 'FDE', 'FDCE', 'FDPE', 'FDRE', 'FDSE', 'FDRSE',
+                     'FD_1', 'FDC', 'FDP', 'FDR', 'FDS')
+
+# Combinational cell type prefixes
+LUT_TYPE_PREFIXES = ('LUT1', 'LUT2', 'LUT3', 'LUT4', 'LUT5', 'LUT6')
+CARRY_TYPE_PREFIXES = ('CARRY4', 'CARRY8')
+MUX_TYPE_PREFIXES = ('MUXF7', 'MUXF8', 'MUXF9', 'MUXF')
+GATE_TYPE_PREFIXES = ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'XNOR', 'BUF', 'INV',
+                       'MUXCY', 'XORCY')
+
+# Combinational cell output pin names (for tracing)
+FF_OUTPUT_PINS = ('Q', 'Q0', 'Q1', 'Q2', 'Q3')
+FF_INPUT_PINS = ('D', 'D0', 'D1', 'D2', 'D3')
+LUT_OUTPUT_PINS = ('O', 'O5', 'O6')
+
 
 
 class Timer:
     """
-    Timer class for timing-aware placement optimization.
+    Timer class for timing-aware placement optimisation.
 
-    This class handles timing analysis, including path delay calculation,
-    timing-weighted objectives, and congestion estimation.
+    Handles timing analysis, path delay calculation, timing-weighted
+    objectives, and congestion estimation.
     """
 
     def __init__(self):
-        """Initialize the Timer."""
         self.timing_library = {}
         self.cell_delays = {}
         self.net_delays = {}
@@ -31,53 +81,25 @@ class Timer:
         self.available_target_sites = []
 
     def setup_timing_analysis(self, design, timing_library):
-        """
-        Set up timing analysis from a design.
-
-        Args:
-            design: RapidWright design object
-            timing_library: Dictionary mapping cell types to timing parameters
-        """
         self.timing_library = timing_library
         self.cell_delays = self.extract_cell_delays(design)
         self.net_delays = self.extract_net_delays(design)
         self.timing_paths = self.extract_timing_paths(design)
 
     def extract_cell_delays(self, design):
-        """
-        Extract cell delays from a design.
-
-        Args:
-            design: RapidWright design object
-
-        Returns:
-            cell_delays: Dictionary mapping cell names to delay info
-        """
         cell_delays = {}
         for cell in design.getCells():
             cell_type = cell.getType()
             if cell_type in self.timing_library:
                 cell_delays[cell.getName()] = self.timing_library[cell_type]
             else:
-                # Default delays
                 cell_delays[cell.getName()] = {
-                    'min_delay': 0.1,
-                    'max_delay': 0.2,
-                    'setup_time': 0.05,
-                    'hold_time': 0.02
+                    'min_delay': 0.1, 'max_delay': 0.2,
+                    'setup_time': 0.05, 'hold_time': 0.02
                 }
         return cell_delays
 
     def extract_net_delays(self, design):
-        """
-        Extract net delays from a design.
-
-        Args:
-            design: RapidWright design object
-
-        Returns:
-            net_delays: Dictionary mapping net names to delay info
-        """
         net_delays = {}
         for net in design.getNets():
             net_length = self.estimate_net_length(net)
@@ -88,463 +110,1021 @@ class Timer:
         return net_delays
 
     def estimate_net_length(self, net):
-        """
-        Estimate the length of a net.
-
-        Args:
-            net: RapidWright net object
-
-        Returns:
-            length: Estimated net length
-        """
-        # Simple estimation based on pin count
-        return len(net.getPins()) * 10  # Basic estimation
+        return len(net.getPins()) * 10
 
     def extract_timing_paths(self, design):
-        """
-        Extract timing paths from a design.
-
-        Args:
-            design: RapidWright design object
-
-        Returns:
-            timing_paths: List of timing path dictionaries
-        """
         timing_paths = []
-
         for cell in design.getCells():
-            if 'FD' in cell.getType():  # Flip-flop
+            if 'FD' in cell.getType():
                 timing_paths.append({
                     'start_cell': cell.getName(),
                     'end_cell': self.find_connected_flipflop(cell),
                     'required_time': 10.0,
                     'criticality': 1.0
                 })
-
         return timing_paths
 
     def find_connected_flipflop(self, cell):
-        """
-        Find a flip-flop connected to the given cell.
-
-        Args:
-            cell: RapidWright cell object
-
-        Returns:
-            cell_name: Name of connected flip-flop or None
-        """
-        # Placeholder - in real implementation would trace connections
+        for net in cell.getNets():
+            for pin in net.getPins():
+                other_cell = pin.getCell()
+                if other_cell and other_cell != cell and 'FD' in other_cell.getType():
+                    return other_cell.getName()
         return None
 
-    def get_expected_placements_from_index(self, p, area_width):
+
+
+@dataclass
+class TimingSummary:
+    """Container for timing analysis results."""
+    wns: float               # Worst Negative Slack (ns) — negative means violation
+    tns: float               # Total Negative Slack (ns)
+    fmax: float              # Estimated maximum clock frequency (MHz)
+    estimated_period: float  # Estimated minimum clock period (ns)
+    critical_path_delay: float  # Estimated critical path delay (ns)
+    logic_depth: int         # Estimated logic depth (levels of logic)
+    num_paths: int           # Number of timing paths analyzed
+    num_violations: int      # Number of paths with violations
+    wire_delays: Dict[str, float] = field(default_factory=dict)  # Per-net wire delay
+    top_violated_nets: List[Tuple[str, float]] = field(default_factory=list)
+
+    def format_report(self) -> str:
+        """Format timing summary as a readable report string."""
+        lines = []
+        lines.append("=" * 65)
+        lines.append("  Timing Analysis Report")
+        lines.append("=" * 65)
+        lines.append(f"  Critical Path Delay : {self.critical_path_delay*1e9:.3f} ns")
+        lines.append(f"  Estimated Period    : {self.estimated_period*1e9:.3f} ns")
+        lines.append(f"  Estimated Fmax      : {self.fmax:.1f} MHz")
+        lines.append(f"  WNS (Worst Neg Slack): {self.wns*1e9:.3f} ns")
+        lines.append(f"  TNS (Total Neg Slack): {self.tns*1e9:.3f} ns")
+        lines.append(f"  Logic Depth         : {self.logic_depth} levels")
+        lines.append(f"  Timing Paths        : {self.num_paths}")
+        lines.append(f"  Violating Paths     : {self.num_violations}")
+        if self.top_violated_nets:
+            lines.append(f"  Top Violated Nets   :")
+            for net_name, slack in self.top_violated_nets[:10]:
+                lines.append(f"    {net_name:<40s} slack={slack*1e9:.3f} ns")
+        lines.append("=" * 65)
+        return "\n".join(lines)
+
+
+class TimingAnalyzer:
+    """
+    Analyzes timing for FPGA placements.
+
+    Provides two modes:
+    - `analyze_framework()`: Estimate timing from placement coordinates + netlist.
+    - `parse_vivado_report()`: Parse Vivado timing_summary.rpt for comparison.
+    """
+
+    def __init__(
+        self,
+        cell_delays: Optional[Dict[str, Dict[str, float]]] = None,
+        wire_delay_per_site: float = DEFAULT_WIRE_DELAY_PER_SITE,
+        clock_period: float = DEFAULT_CLOCK_PERIOD,
+        ff_setup_time: float = 40e-12,
+        ff_clk2q_time: float = 60e-12,
+    ):
         """
-        Get expected placement coordinates from probability distribution.
+        Args:
+            cell_delays: Dict mapping cell types to delay dicts.
+            wire_delay_per_site: Wire delay per SLICE pitch (seconds).
+            clock_period: Target clock period in seconds.
+            ff_setup_time: Flip-flop setup time (seconds).
+            ff_clk2q_time: Flip-flop clock-to-Q delay (seconds).
+        """
+        self.cell_delays = cell_delays or DEFAULT_CELL_DELAYS
+        self.wire_delay_per_site = wire_delay_per_site
+        self.clock_period = clock_period
+        self.ff_setup_time = ff_setup_time
+        self.ff_clk2q_time = ff_clk2q_time
+
+    # =========================================================================
+    # Framework-Level Timing Estimation
+    # =========================================================================
+
+    def analyze_framework(
+        self,
+        net_manager: Any,
+        logic_coords: torch.Tensor,
+        io_coords: Optional[torch.Tensor] = None,
+        include_io: bool = False,
+        clock_period: Optional[float] = None,
+    ) -> TimingSummary:
+        """
+        Estimate timing metrics from placement coordinates and netlist.
+
+        Uses a simple model:
+        - Net wire delay = HPWL * wire_delay_per_unit
+        - Path delay = sum of cell delays + sum of wire delays along path
+        - Critical path approximated by logic_depth most congested nets
 
         Args:
-            p: Probability distribution [batch_size, num_instances, num_sites]
-            area_width: Width of the placement area
+            net_manager: The NetManager instance (provides net_to_sites, etc.)
+            logic_coords: Placed logic instance coordinates [N, 2]
+            io_coords: Placed IO instance coordinates [M, 2] (optional)
+            include_io: Whether to include IO instances in analysis.
+            clock_period: Override target clock period (seconds).
 
         Returns:
-            expected_coords: Expected coordinates [batch_size, num_instances, 2]
+            TimingSummary with estimated timing metrics.
         """
-        batch_size, num_instances, num_sites = p.shape
-        device = p.device
+        if clock_period is not None:
+            self.clock_period = clock_period
 
-        # Create coordinate matrix
-        indices = torch.arange(num_sites, dtype=torch.float32, device=device)
-        x_coords = indices % area_width
-        y_coords = indices // area_width
-        site_coords = torch.stack([x_coords, y_coords], dim=1)
+        device = logic_coords.device
 
-        # Calculate expected coordinates
-        expected_coords = torch.matmul(p, site_coords)
-        return expected_coords
+        # Build coordinate lookup: site_name -> (x, y)
+        inst_coords = self._build_coord_lookup(
+            net_manager, logic_coords, io_coords, include_io
+        )
 
-    def calculate_timing_based_hpwl(self, J_extended, p, area_width, timing_criticality):
+        # Compute per-net wire delays using HPWL (Manhattan distance)
+        net_wire_delays: Dict[str, float] = {}
+        net_hpwls: Dict[str, float] = {}
+        net_site_counts: Dict[str, int] = {}
+
+        for net_name, sites in net_manager.net_to_sites.items():
+            coords_list = []
+            for s in sites:
+                if s in inst_coords:
+                    coords_list.append(inst_coords[s])
+
+            if len(coords_list) < 2:
+                continue
+
+            # Compute HPWL (Manhattan bounding box)
+            xs = [c[0] for c in coords_list]
+            ys = [c[1] for c in coords_list]
+            hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
+            net_hpwls[net_name] = hpwl
+
+            # Estimate wire delay: HPWL * wire_delay_per_site
+            wire_delay = hpwl * self.wire_delay_per_site
+            net_wire_delays[net_name] = wire_delay
+            net_site_counts[net_name] = len(coords_list)
+
+        # Estimate logic depth from net_manager (already computed) or compute
+        logic_depth_val = getattr(net_manager, 'logic_depth', 1.0)
+        # logic_depth_val is a factor around 1.0; convert to approximate levels
+        logic_levels = max(1, int(round(logic_depth_val * 8)))
+
+        # Estimate cell delay per logic level
+        avg_cell_delay = (
+            self.cell_delays.get('LUT', {}).get('max', 100e-12) +
+            self.cell_delays.get('CARRY', {}).get('max', 60e-12)
+        ) / 2.0
+
+        # Sort nets by wire delay (longest first) — these are potential critical paths
+        sorted_nets = sorted(net_wire_delays.items(), key=lambda x: x[1], reverse=True)
+
+        # --- Critical Path Estimation ---
+        # Model: A critical path goes through `logic_levels` stages.
+        # Each stage has: 1 cell delay + wire delay of the net driving it.
+        # We take the top N nets (where N = logic_levels) as the critical path.
+        num_critical_nets = min(logic_levels, len(sorted_nets))
+        critical_nets = sorted_nets[:num_critical_nets]
+
+        # Sum delays along estimated critical path
+        # Cell delay per stage
+        total_cell_delay = logic_levels * avg_cell_delay
+
+        # Wire delay along critical path (sum of top N longest nets)
+        total_wire_delay_critical = sum(d for _, d in critical_nets)
+
+        # Clock-to-Q and setup overhead
+        total_ff_overhead = self.ff_clk2q_time + self.ff_setup_time
+
+        critical_path_delay = total_cell_delay + total_wire_delay_critical + total_ff_overhead
+
+        # Compute WNS
+        wns = self.clock_period - critical_path_delay
+
+        # Compute TNS (sum of negative slacks across all paths)
+        # Estimate per-path delay for all significant nets
+        tns = 0.0
+        num_violations = 0
+        all_path_delays = []
+
+        for net_name, wire_delay in sorted_nets:
+            # Each net represents a potential path stage
+            path_delay = avg_cell_delay + wire_delay + self.ff_overhead_per_stage()
+            all_path_delays.append(path_delay)
+
+            slack = self.clock_period - path_delay
+            if slack < 0:
+                tns += slack
+                num_violations += 1
+
+        # Also add some multi-stage paths
+        if len(sorted_nets) >= logic_levels:
+            for i in range(len(sorted_nets) - logic_levels + 1):
+                group = sorted_nets[i:i+logic_levels]
+                path_delay = (
+                    logic_levels * avg_cell_delay
+                    + sum(d for _, d in group)
+                    + self.ff_clk2q_time + self.ff_setup_time
+                )
+                slack = self.clock_period - path_delay
+                if slack < 0:
+                    tns += slack
+
+        # Compute Fmax
+        estimated_period = critical_path_delay
+        fmax = 1.0 / estimated_period if estimated_period > 0 else 0.0
+
+        # Top violated nets
+        top_violated = []
+        for net_name, wire_delay in sorted_nets:
+            path_delay = avg_cell_delay + wire_delay + self.ff_overhead_per_stage()
+            slack = self.clock_period - path_delay
+            if slack < 0:
+                top_violated.append((net_name, slack))
+
+        return TimingSummary(
+            wns=wns,
+            tns=tns,
+            fmax=fmax / 1e6,  # Convert to MHz
+            estimated_period=estimated_period,
+            critical_path_delay=critical_path_delay,
+            logic_depth=logic_levels,
+            num_paths=len(sorted_nets) + max(0, len(sorted_nets) - logic_levels + 1),
+            num_violations=num_violations,
+            wire_delays=net_wire_delays,
+            top_violated_nets=top_violated[:20],
+        )
+
+    # =========================================================================
+    # Path-Based Timing Analysis (actual FF-to-FF paths)
+    # =========================================================================
+
+    def analyze_path_based(
+        self,
+        design: Any,
+        placer: Any,
+        logic_coords: torch.Tensor,
+        io_coords: Optional[torch.Tensor] = None,
+        include_io: bool = False,
+        clock_period: Optional[float] = None,
+        max_paths: int = 10000,
+    ) -> TimingSummary:
         """
-        Calculate timing-weighted HPWL.
+        Perform path-based timing analysis by tracing actual FF-to-FF paths
+        through the netlist and computing delays from placement coordinates.
+
+        This is more accurate than the heuristic ``analyze_framework`` method
+        because it traces real combinational paths and accounts for all cells
+        (LUTs, CARRY, MUX) and wire delays along each path.
 
         Args:
-            J_extended: Extended coupling matrix
-            p: Probability distribution
-            area_width: Width of the placement area
-            timing_criticality: Weight for timing criticality
+            design: RapidWright Design object (provides getCells(), getNets()).
+            placer: FpgaPlacer instance (provides instance name<->id mappings).
+            logic_coords: Placed logic instance coordinates [N, 2].
+            io_coords: Placed IO instance coordinates [M, 2] (optional).
+            include_io: Whether to include IO in analysis.
+            clock_period: Override target clock period (seconds).
+            max_paths: Maximum number of paths to analyze (limits runtime).
 
         Returns:
-            weighted_wirelength: Timing-weighted total wirelength
+            TimingSummary with actual path-based timing metrics.
         """
-        batch_size = p.shape[0]
-        expected_coords = self.get_expected_placements_from_index(p, area_width)
+        import time as _time
+        _t0 = _time.time()
 
-        J = torch.tensor(J_extended, dtype=torch.float32, device=p.device)
+        if clock_period is not None:
+            self.clock_period = clock_period
 
-        # Apply timing criticality weights
-        timing_weights = self.calculate_timing_weights(J_extended, timing_criticality)
-        weighted_J = J * timing_weights
+        # ------------------------------------------------------------------
+        # 1. Build site_name -> (x, y) coordinate lookup
+        # ------------------------------------------------------------------
+        site_to_coord: Dict[str, Tuple[float, float]] = {}
+        logic_insts = placer.instances.get('logic')
+        if logic_insts is not None:
+            for name, inst_id in logic_insts.name_to_id.items():
+                if inst_id < len(logic_coords):
+                    c = logic_coords[inst_id]
+                    site_to_coord[name] = (float(c[0]), float(c[1]))
+        if include_io and io_coords is not None:
+            io_insts = placer.instances.get('io')
+            if io_insts is not None:
+                for name, inst_id in io_insts.name_to_id.items():
+                    if inst_id < len(io_coords):
+                        c = io_coords[inst_id]
+                        site_to_coord[name] = (float(c[0]), float(c[1]))
+        INFO(f"  [path_timing] coord lookup: {len(site_to_coord)} sites, {_time.time()-_t0:.1f}s")
 
-        # Calculate weighted HPWL
-        coords_i = expected_coords.unsqueeze(2)
-        coords_j = expected_coords.unsqueeze(1)
-        manhattan_dist = torch.sum(torch.abs(coords_i - coords_j), dim=-1)
+        # ------------------------------------------------------------------
+        # 2. Build site_name -> BEL classification from the physical device
+        # ------------------------------------------------------------------
+        # Instead of using Cell objects (which we can't map to pins), we
+        # classify each BEL (Basic Element of Logic) by its name:
+        #
+        #   BEL name contains "FF"/"REG"  → is_ff_bel
+        #   BEL name contains "LUT"/"CARRY"/"MUX" → is_combo_bel
+        #
+        # The node ID for each BEL is f"{site_name}/{bel_name}".
+        # We also build a set of site pins that are FF D/Q pins so we can
+        # identify FF boundaries during net traversal.
 
-        weighted_dist = manhattan_dist * weighted_J.unsqueeze(0)
-        triu_mask = torch.triu(torch.ones_like(J), diagonal=1).bool()
-        weighted_dist_triu = weighted_dist[:, triu_mask]
+        is_ff_bel: Dict[str, bool] = {}       # bel_id -> True if FF
+        is_combo_bel: Dict[str, bool] = {}    # bel_id -> True if combo
+        bel_to_site: Dict[str, str] = {}      # bel_id -> site_name
 
-        total_wirelength = torch.sum(weighted_dist_triu, dim=1)
+        # Collect all unique (site, BEL) pairs from the design
+        for cell in design.getCells():
+            si = cell.getSiteInst()
+            if si is None:
+                continue
+            sname = str(si.getName())
+            bel = cell.getBEL()
+            if bel is None:
+                continue
+            bel_name = str(bel.getName())
+            bel_id = f"{sname}/{bel_name}"
 
-        return torch.mean(total_wirelength) / batch_size
+            # Classify by BEL name
+            is_ff = ('FF' in bel_name) or ('REG' in bel_name)
+            is_lut = 'LUT' in bel_name
+            is_carry = 'CARRY' in bel_name
+            is_mux = 'MUX' in bel_name
+            is_combo = is_lut or is_carry or is_mux
 
-    def calculate_timing_weights(self, J_extended, timing_criticality):
+            if is_ff:
+                is_ff_bel[bel_id] = True
+            if is_combo:
+                is_combo_bel[bel_id] = True
+            bel_to_site[bel_id] = sname
+
+        n_ff = sum(is_ff_bel.values())
+        n_combo = sum(is_combo_bel.values())
+        INFO(f"  [path_timing] {n_ff} FF-BELs, {n_combo} combo-BELs, "
+             f"{len(bel_to_site)} total BELs, {_time.time()-_t0:.1f}s")
+
+        # ------------------------------------------------------------------
+        # 3. Build BEL-level connectivity from physical net → pin → BEL
+        # ------------------------------------------------------------------
+        # We assign each net pin to a BEL identifier, avoiding Cell objects.
+        # Direction (output vs input) determines whether the BEL drives the
+        # net or receives it. Within a SLICE, internal routing may connect
+        # BEL-to-BEL without going through a global net — we only capture
+        # connections that go through the routing fabric (have a SitePin).
+
+        bel_out_nets: Dict[str, List[str]] = {}   # bel_id -> [net_name, ...]
+        net_in_bels: Dict[str, List[str]] = {}     # net_name -> [bel_id, ...]
+
+        n_pins_total = 0
+        n_pins_matched = 0
+        n_pins_unmatched = 0
+        n_out_edges = 0
+        n_in_edges = 0
+
+        n_no_siteinst = 0
+        n_no_belpin = 0
+        n_isoutput_fail = 0
+        n_no_bel = 0
+        n_input_filtered = 0
+
+        sample_failures: List[str] = []
+
+        for net in design.getNets():
+            net_name = str(net.getName())
+            if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
+                continue
+
+            for pin in net.getPins():
+                n_pins_total += 1
+
+                si = pin.getSiteInst()
+                if si is None:
+                    n_no_siteinst += 1
+                    n_pins_unmatched += 1
+                    continue
+
+                bel_pin = pin.getBELPin()
+                if bel_pin is None:
+                    n_no_belpin += 1
+                    n_pins_unmatched += 1
+                    continue
+
+                try:
+                    is_output = bool(pin.isOutPin())
+                except Exception:
+                    n_isoutput_fail += 1
+                    n_pins_unmatched += 1
+                    continue
+
+                bel = bel_pin.getBEL()
+                if bel is None:
+                    n_no_bel += 1
+                    n_pins_unmatched += 1
+                    continue
+
+                sname = str(si.getName())
+                bel_name = str(bel.getName())
+                bel_id = f"{sname}/{bel_name}"
+                bel_pin_name = str(bel_pin.getName())
+                n_pins_matched += 1
+
+                if is_output:
+                    bel_out_nets.setdefault(bel_id, []).append(net_name)
+                    n_out_edges += 1
+                    if n_out_edges <= 10:
+                        INFO(f"  [path_timing]   output pin: bel={bel_id} pin={bel_pin_name} net={net_name}")
+                else:
+                    # Only trace data input pins (skip CLK, CE, SR, etc.)
+                    if bel_pin_name in ('D',) or \
+                       bel_pin_name.startswith('DI') or \
+                       (bel_pin_name.startswith('I') and len(bel_pin_name) <= 4):
+                        net_in_bels.setdefault(net_name, []).append(bel_id)
+                        n_in_edges += 1
+                        if n_in_edges <= 10:
+                            INFO(f"  [path_timing]   input pin: bel={bel_id} pin={bel_pin_name} net={net_name}")
+                    else:
+                        n_input_filtered += 1
+                        if n_input_filtered <= 20:
+                            INFO(f"  [path_timing]   filtered input: bel={bel_id} pin={bel_pin_name}")
+
+        INFO(f"  [path_timing] net pins: {n_pins_total} total, "
+             f"{n_pins_matched} matched, {n_pins_unmatched} unmatched, "
+             f"out_edges={n_out_edges}, in_edges={n_in_edges}")
+        INFO(f"  [path_timing]   fail reasons: noSiteInst={n_no_siteinst} "
+             f"noBELPin={n_no_belpin} isOutPinFail={n_isoutput_fail} "
+             f"noBEL={n_no_bel} inputFiltered={n_input_filtered}")
+        INFO(f"  [path_timing] connectivity: {len(bel_out_nets)} driving BELs, "
+             f"{len(net_in_bels)} driven nets, {_time.time()-_t0:.1f}s")
+
+        # Sample a few FF BELs and show their connectivity
+        _ff_sample_count = 0
+        for bel_id in list(is_ff_bel.keys()):
+            if _ff_sample_count >= 3:
+                break
+            out_nets = bel_out_nets.get(bel_id, [])
+            in_nets = [n for n, bs in net_in_bels.items() if bel_id in bs]
+            site = bel_to_site.get(bel_id, '?')
+            INFO(f"  [path_timing] FF-BEL sample: {bel_id} @ {site}, "
+                 f"out_nets={out_nets[:3]}, in_nets={in_nets[:3]}")
+            _ff_sample_count += 1
+
+        # ------------------------------------------------------------------
+        # 4. Trace FF-to-FF paths at the *BEL* level
+        # ------------------------------------------------------------------
+        # A path is a list of (bel_id, site_name, role) tuples.
+        # Node IDs are BEL identifiers like "SLICE_X106Y160/FF2".
+
+        BelPathEntry = Tuple[str, str, str]  # (bel_id, site_name, role)
+        all_paths: List[List[BelPathEntry]] = []
+        visited_bels: set = set()
+
+        ff_with_out = sum(1 for b in is_ff_bel if b in bel_out_nets and bel_out_nets[b])
+        ff_without_out = sum(1 for b in is_ff_bel if b not in bel_out_nets or not bel_out_nets[b])
+        combo_with_out = sum(1 for b in is_combo_bel if b in bel_out_nets and bel_out_nets[b])
+        combo_without_out = sum(1 for b in is_combo_bel if b not in bel_out_nets or not bel_out_nets[b])
+        nets_driving_bels = sum(1 for n, bs in net_in_bels.items() if bs)
+        INFO(f"  [path_timing] FF-BELs with/without output nets: {ff_with_out}/{ff_without_out}")
+        INFO(f"  [path_timing] Combo-BELs with/without output nets: {combo_with_out}/{combo_without_out}")
+        INFO(f"  [path_timing] Nets that drive at least one BEL: {nets_driving_bels}")
+
+        def _trace_from_ff(bel_id: str, max_depth: int = 30):
+            if bel_id in visited_bels:
+                return
+            visited_bels.add(bel_id)
+            site = bel_to_site.get(bel_id, '')
+
+            out_nets = bel_out_nets.get(bel_id, [])
+            for net_name in out_nets:
+                driven_bels = net_in_bels.get(net_name, [])
+                for db in driven_bels:
+                    if db in visited_bels:
+                        continue
+                    if is_ff_bel.get(db, False):
+                        all_paths.append([
+                            (bel_id, site, 'src_ff'),
+                            (db, bel_to_site.get(db, ''), 'sink_ff'),
+                        ])
+                    elif is_combo_bel.get(db, False):
+                        _trace_combo_chain(db, [
+                            (bel_id, site, 'src_ff'),
+                        ], depth=1, max_depth=max_depth)
+
+        def _trace_combo_chain(bel_id: str, path_so_far: List[BelPathEntry],
+                                depth: int, max_depth: int):
+            if depth > max_depth:
+                return
+            visited_bels.add(bel_id)
+            site = bel_to_site.get(bel_id, '')
+            out_nets = bel_out_nets.get(bel_id, [])
+            for net_name in out_nets:
+                driven_bels = net_in_bels.get(net_name, [])
+                for db in driven_bels:
+                    if db in visited_bels:
+                        continue
+                    if is_ff_bel.get(db, False):
+                        all_paths.append(path_so_far + [
+                            (bel_id, site, 'combo'),
+                            (db, bel_to_site.get(db, ''), 'sink_ff'),
+                        ])
+                    elif is_combo_bel.get(db, False):
+                        _trace_combo_chain(
+                            db, path_so_far + [(bel_id, site, 'combo')],
+                            depth + 1, max_depth)
+
+        ff_bels = [b for b, v in is_ff_bel.items() if v]
+        INFO(f"  [path_timing] tracing from {len(ff_bels)} source FF-BELs...")
+
+        ff_budget = min(len(ff_bels), 2000)
+        for fb in ff_bels[:ff_budget]:
+            _trace_from_ff(fb)
+
+        INFO(f"  [path_timing] found {len(all_paths)} FF-to-FF paths, "
+             f"{_time.time()-_t0:.1f}s")
+
+        if len(all_paths) > max_paths:
+            all_paths = all_paths[:max_paths]
+
+        # ------------------------------------------------------------------
+        # 5. Compute delays for each path
+        # ------------------------------------------------------------------
+        # We use a per-site average combo delay since BEL-level cell types
+        # are already classified by BEL name.
+
+        def _bel_type_to_delay(bel_name: str) -> float:
+            if 'LUT' in bel_name:
+                return self.cell_delays.get('LUT', {}).get('max', 100e-12)
+            if 'CARRY' in bel_name:
+                return self.cell_delays.get('CARRY', {}).get('max', 80e-12)
+            if 'MUX' in bel_name:
+                return self.cell_delays.get('MUX', {}).get('max', 90e-12)
+            if 'DSP' in bel_name:
+                return self.cell_delays.get('DSP', {}).get('max', 500e-12)
+            if 'RAMB' in bel_name or 'BRAM' in bel_name:
+                return self.cell_delays.get('BRAM', {}).get('max', 600e-12)
+            return 60e-12
+
+        path_delays: List[float] = []
+        path_descriptions: List[str] = []
+
+        for path in all_paths:
+            total_cell_delay = 0.0
+            total_wire_delay = 0.0
+
+            for i, (bel_id, site_name, role) in enumerate(path):
+                if role == 'sink_ff':
+                    continue
+
+                if role == 'src_ff':
+                    total_cell_delay += self.ff_clk2q_time
+                else:
+                    # Extract BEL name from bel_id (format: "site/belname")
+                    bel_short = bel_id.split('/')[-1] if '/' in bel_id else ''
+                    total_cell_delay += _bel_type_to_delay(bel_short)
+
+                # Wire delay to next site
+                if i + 1 < len(path):
+                    next_site = path[i + 1][1]
+                    if site_name in site_to_coord and next_site in site_to_coord:
+                        x1, y1 = site_to_coord[site_name]
+                        x2, y2 = site_to_coord[next_site]
+                        dist = abs(x1 - x2) + abs(y1 - y2)
+                        total_wire_delay += dist * self.wire_delay_per_site
+
+            total_cell_delay += self.ff_setup_time
+
+            total_delay = total_cell_delay + total_wire_delay
+            path_delays.append(total_delay)
+
+            desc = f"{path[0][0]} -> ... -> {path[-1][0]}"
+            path_descriptions.append(desc)
+
+        # ------------------------------------------------------------------
+        # 6. Compute timing metrics
+        # ------------------------------------------------------------------
+        if not path_delays:
+            INFO("  [path_timing] No FF-to-FF paths found — falling back to heuristic.")
+            return self.analyze_framework(
+                placer.net_manager, logic_coords, io_coords, include_io, clock_period
+            )
+
+        critical_path_delay = max(path_delays)
+        wns = self.clock_period - critical_path_delay
+
+        tns = 0.0
+        num_violations = 0
+        for pd in path_delays:
+            slack = self.clock_period - pd
+            if slack < 0:
+                tns += slack
+                num_violations += 1
+
+        estimated_period = critical_path_delay
+        fmax = 1.0 / estimated_period if estimated_period > 0 else 0.0
+
+        logic_levels = max((len(p) - 1) for p in all_paths) if all_paths else 0
+
+        violated = [(desc, self.clock_period - pd)
+                    for desc, pd in zip(path_descriptions, path_delays)
+                    if (self.clock_period - pd) < 0]
+        violated.sort(key=lambda x: x[1])
+
+        INFO(f"  [path_timing] critical path: {critical_path_delay*1e9:.3f} ns, "
+             f"WNS={wns*1e9:.3f} ns, Fmax={fmax/1e6:.1f} MHz, "
+             f"took {_time.time()-_t0:.1f}s")
+
+        return TimingSummary(
+            wns=wns,
+            tns=tns,
+            fmax=fmax / 1e6,  # Convert to MHz
+            estimated_period=estimated_period,
+            critical_path_delay=critical_path_delay,
+            logic_depth=logic_levels,
+            num_paths=len(path_delays),
+            num_violations=num_violations,
+            wire_delays={},
+            top_violated_nets=violated[:20],
+        )
+
+    def ff_overhead_per_stage(self) -> float:
+        """Clock-to-Q + setup time for one flip-flop stage."""
+        return self.ff_clk2q_time + self.ff_setup_time
+
+    def _build_coord_lookup(
+        self,
+        net_manager: Any,
+        logic_coords: torch.Tensor,
+        io_coords: Optional[torch.Tensor],
+        include_io: bool,
+    ) -> Dict[str, Tuple[float, float]]:
+        """Build site_name -> (x, y) mapping from placement coordinates.
+
+        Uses the net_manager's site-to-name and name-to-site mappings
+        which are built during the analyze_nets phase.
         """
-        Calculate timing criticality weights.
+        inst_coords: Dict[str, Tuple[float, float]] = {}
+
+        # Map logic instances by looking up the get_site_inst_id_by_name_func
+        # which is a bound method on the placer, providing name<->id mappings.
+        get_name_by_id = getattr(net_manager, 'get_site_inst_id_by_name_func', None)
+        get_id_by_name = getattr(net_manager, 'get_site_inst_id_by_name_func', None)
+
+        # Approach: iterate over all instance names known to the net_manager
+        # via site_to_site_connectivity and net_to_sites dictionaries.
+        known_names: set = set()
+        for net_sites in net_manager.net_to_sites.values():
+            known_names.update(net_sites)
+
+        # Build a reverse mapping: we know site names from net_to_sites,
+        # but we need their indices. We can infer from the matrix dimensions.
+        # Simpler approach: use the placer's internal name_to_id mappings
+        # by accessing through the bound function reference.
+        try:
+            # The get_site_inst_id_by_name_func is typically a bound method
+            # of the FpgaPlacer instance. Access the parent to get instance maps.
+            placer = get_id_by_name.__self__ if hasattr(get_id_by_name, '__self__') else None
+            if placer is not None:
+                logic_insts = placer.instances.get('logic')
+                if logic_insts is not None:
+                    for name, inst_id in logic_insts.name_to_id.items():
+                        if inst_id < len(logic_coords):
+                            c = logic_coords[inst_id]
+                            inst_coords[name] = (float(c[0]), float(c[1]))
+
+                if include_io and io_coords is not None:
+                    io_insts = placer.instances.get('io')
+                    if io_insts is not None:
+                        for name, inst_id in io_insts.name_to_id.items():
+                            if inst_id < len(io_coords):
+                                c = io_coords[inst_id]
+                                inst_coords[name] = (float(c[0]), float(c[1]))
+            else:
+                # Fallback: use net_to_sites with index-based mapping
+                self._build_coord_lookup_fallback(
+                    inst_coords, net_manager, logic_coords, io_coords, include_io
+                )
+        except (AttributeError, IndexError, TypeError) as e:
+            # Fallback
+            self._build_coord_lookup_fallback(
+                inst_coords, net_manager, logic_coords, io_coords, include_io
+            )
+
+        return inst_coords
+
+    def _build_coord_lookup_fallback(
+        self,
+        inst_coords: Dict[str, Tuple[float, float]],
+        net_manager: Any,
+        logic_coords: torch.Tensor,
+        io_coords: Optional[torch.Tensor],
+        include_io: bool,
+    ):
+        """Fallback coordinate lookup using index-based assignment."""
+        known_names: list = []
+        for net_sites in net_manager.net_to_sites.values():
+            for s in net_sites:
+                if s not in inst_coords:
+                    known_names.append(s)
+
+        # Assign coordinates by index (order-preserving)
+        for i, name in enumerate(known_names):
+            if i < len(logic_coords):
+                c = logic_coords[i]
+                inst_coords[name] = (float(c[0]), float(c[1]))
+
+        if include_io and io_coords is not None:
+            io_names = []
+            for net_sites in net_manager.net_to_sites.values():
+                for s in net_sites:
+                    if s not in inst_coords and s not in io_names:
+                        io_names.append(s)
+            for i, name in enumerate(io_names):
+                if i < len(io_coords):
+                    c = io_coords[i]
+                    inst_coords[name] = (float(c[0]), float(c[1]))
+
+    # =========================================================================
+    # Vivado Timing Report Parser
+    # =========================================================================
+
+    def parse_vivado_report(self, report_path: str) -> Optional[TimingSummary]:
+        """
+        Parse a Vivado timing_summary.rpt file to extract timing metrics.
+
+        Returns None if the report contains no timing constraints or cannot be parsed.
 
         Args:
-            J_extended: Extended coupling matrix
-            timing_criticality: Weight factor for timing
+            report_path: Path to the Vivado timing_summary.rpt file.
 
         Returns:
-            timing_weights: Timing weight matrix
+            TimingSummary with metrics from Vivado, or None if not available.
         """
-        num_instances = J_extended.shape[0]
-        timing_weights = np.ones_like(J_extended)
+        if not os.path.exists(report_path):
+            return None
 
-        for path in self.timing_paths:
-            start_idx = self.site_to_index.get(path['start_cell'], -1)
-            end_idx = self.site_to_index.get(path['end_cell'], -1)
+        try:
+            with open(report_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            return None
 
-            if start_idx != -1 and end_idx != -1:
-                criticality = path['criticality'] * timing_criticality
-                timing_weights[start_idx, end_idx] += criticality
-                timing_weights[end_idx, start_idx] += criticality
+        # Check if there are timing constraints
+        if "There are no user specified timing constraints" in content:
+            return None
 
-        return torch.tensor(timing_weights, dtype=torch.float32)
+        # Parse Design Timing Summary section
+        # Pattern: WNS(ns)  TNS(ns)  TNS Failing ...
+        timing_section = self._extract_section(content, "Design Timing Summary", "Timing Details")
+        if not timing_section:
+            return None
 
-    def calculate_path_delays(self, p, area_width):
+        wns = self._parse_float_field(timing_section, "WNS(ns)")
+        tns = self._parse_float_field(timing_section, "TNS(ns)")
+        whs = self._parse_float_field(timing_section, "WHS(ns)")
+        wpws = self._parse_float_field(timing_section, "WPWS(ns)")
+        tns_failing = self._parse_int_field(timing_section, "TNS Failing Endpoints")
+        tns_total = self._parse_int_field(timing_section, "TNS Total Endpoints")
+
+        # Parse clock period from the Intra Clock Table if available
+        clock_period = None
+        clock_section = self._extract_section(content, "Intra Clock Table", "Inter Clock Table")
+        if clock_section:
+            # Look for clock names and their WNS
+            lines = clock_section.strip().split('\n')
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] not in ('Clock', '-----', ''):
+                    # First column is clock name, second is WNS
+                    clock_wns = self._safe_float(parts[1])
+                    if clock_wns is not None and clock_wns != 'NA':
+                        # Clock period can be inferred if we know the target
+                        pass
+
+        # Parse timing paths if available for Fmax estimation
+        path_section = self._extract_section(content, "Timing Details", "")
+        if path_section and wns is not None and wns != 'NA':
+            # Fmax from WNS: Fmax = 1 / (clock_period - WNS) if clock_period known
+            # Without clock period, we can't compute Fmax from the report alone
+            pass
+
+        if wns is None or wns == 'NA':
+            return None
+
+        # Convert WNS, TNS from ns to seconds (Vivado reports in ns)
+        wns_sec = float(wns) * 1e-9 if wns != 'NA' else 0.0
+        tns_sec = float(tns) * 1e-9 if tns is not None and tns != 'NA' else 0.0
+
+        num_failing = int(tns_failing) if tns_failing is not None and tns_failing != 'NA' else 0
+        num_total = int(tns_total) if tns_total is not None and tns_total != 'NA' else 0
+
+        return TimingSummary(
+            wns=wns_sec,
+            tns=tns_sec,
+            fmax=0.0,  # Cannot compute Fmax without clock definition
+            estimated_period=0.0,
+            critical_path_delay=0.0,
+            logic_depth=0,
+            num_paths=num_total,
+            num_violations=num_failing,
+            wire_delays={},
+            top_violated_nets=[],
+        )
+
+    def parse_vivado_timing_paths(self, report_path: str) -> List[Dict[str, Any]]:
         """
-        Calculate timing path delays.
+        Parse detailed timing path report for path-specific delays.
 
         Args:
-            p: Probability distribution
-            area_width: Width of the placement area
+            report_path: Path to a Vivado timing report (e.g., timing_paths.rpt).
 
         Returns:
-            path_delays: List of path delay dictionaries
+            List of path dicts with slack, delay, source, destination.
         """
-        batch_size = p.shape[0]
-        expected_coords = self.get_expected_placements_from_index(p, area_width)
+        if not os.path.exists(report_path):
+            return []
 
-        path_delays = []
+        try:
+            with open(report_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            return []
 
-        for path in self.timing_paths:
-            start_idx = self.site_to_index.get(path['start_cell'], -1)
-            end_idx = self.site_to_index.get(path['end_cell'], -1)
+        paths = []
+        # Parse individual timing paths (Vivado detailed timing report format)
+        # Each path starts with "---" separator and contains "Slack:" and "Delay:"
+        path_blocks = re.split(r'-{3,}', content)
 
-            if start_idx != -1 and end_idx != -1:
-                start_coords = expected_coords[:, start_idx, :]
-                end_coords = expected_coords[:, end_idx, :]
-                path_length = torch.sum(torch.abs(start_coords - end_coords), dim=1)
+        for block in path_blocks:
+            if 'Slack' not in block and 'slack' not in block.lower():
+                continue
 
-                cell_delay = (self.cell_delays.get(path['start_cell'], {}).get('max_delay', 0.1) +
-                             self.cell_delays.get(path['end_cell'], {}).get('max_delay', 0.1))
+            slack = self._parse_field_value(block, r'Slack\s*:\s*([-\d.]+)')
+            delay = self._parse_field_value(block, r'(?:Total|Logic)\s+Delay\s*:\s*([-\d.]+)')
+            source = self._parse_field_value(block, r'Source\s*:\s*(\S+)')
+            dest = self._parse_field_value(block, r'Destination\s*:\s*(\S+)')
 
-                net_key = path['start_cell'] + '_to_' + str(path['end_cell'])
-                unit_delay = self.net_delays.get(net_key, {}).get('unit_delay', 0.01)
-                wire_delay = path_length * unit_delay
-
-                total_delay = cell_delay + wire_delay
-                path_delays.append({
-                    'delay': total_delay,
-                    'required_time': path['required_time'],
-                    'slack': path['required_time'] - total_delay,
-                    'criticality': path['criticality']
+            if slack is not None:
+                paths.append({
+                    'slack': float(slack),
+                    'delay': float(delay) if delay else 0.0,
+                    'source': source or '',
+                    'destination': dest or '',
+                    'clock_period': float(delay) + float(slack) if delay and slack else 0.0,
                 })
 
-        return path_delays
+        return paths
+
+    # =========================================================================
+    # Utility methods
+    # =========================================================================
+
+    def _extract_section(self, content: str, start_header: str, end_header: str) -> Optional[str]:
+        """Extract a section between two headers."""
+        start_idx = content.find(start_header)
+        if start_idx == -1:
+            return None
+
+        if end_header:
+            end_idx = content.find(end_header, start_idx + len(start_header))
+            if end_idx == -1:
+                return content[start_idx:]
+            return content[start_idx:end_idx]
+        return content[start_idx:]
+
+    def _parse_float_field(self, section: str, field_name: str) -> Optional[str]:
+        """Extract a float value field from a table section."""
+        # Try to find the field in a table row
+        pattern = rf'{re.escape(field_name)}\s+([-\d.]+|NA)'
+        match = re.search(pattern, section)
+        if match:
+            val = match.group(1)
+            return val if val != 'NA' else 'NA'
+        return None
+
+    def _parse_int_field(self, section: str, field_name: str) -> Optional[str]:
+        """Extract an integer value field from a table section."""
+        pattern = rf'{re.escape(field_name)}\s+(\d+|NA)'
+        match = re.search(pattern, section)
+        if match:
+            val = match.group(1)
+            return val if val != 'NA' else 'NA'
+        return None
+
+    def _parse_field_value(self, text: str, pattern: str) -> Optional[str]:
+        """Extract a field value using regex."""
+        match = re.search(pattern, text)
+        return match.group(1) if match else None
+
+    def _safe_float(self, val: str) -> Optional[float]:
+        """Safely parse a float, returning None on failure."""
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+
+# =============================================================================
+# Convenience functions
+# =============================================================================
+
+def analyze_placement_timing(
+    placer: Any,
+    logic_coords: torch.Tensor,
+    io_coords: Optional[torch.Tensor] = None,
+    include_io: bool = False,
+    clock_period_ns: float = 5.0,
+    mode: str = 'heuristic',
+    design: Optional[Any] = None,
+    max_paths: int = 10000,
+) -> TimingSummary:
+    """
+    Convenience function to analyze timing for a placement result.
+
+    Args:
+        placer: An FpgaPlacer instance (provides net_manager).
+        logic_coords: Placed logic coordinates [N, 2].
+        io_coords: Placed IO coordinates [M, 2] (optional).
+        include_io: Whether to include IO in analysis.
+        clock_period_ns: Target clock period in nanoseconds.
+        mode: ``'heuristic'`` (HPWL-based estimate) or ``'path'`` (actual
+            FF-to-FF path tracing; requires ``design``).
+        design: RapidWright Design object (required for ``mode='path'``).
+        max_paths: Max paths to trace for ``mode='path'``.
+
+    Returns:
+        TimingSummary with estimated timing metrics.
+    """
+    analyzer = TimingAnalyzer(clock_period=clock_period_ns * 1e-9)
+    if mode == 'path':
+        if design is None:
+            raise ValueError("'design' argument required for mode='path'")
+        return analyzer.analyze_path_based(
+            design=design,
+            placer=placer,
+            logic_coords=logic_coords,
+            io_coords=io_coords,
+            include_io=include_io,
+            clock_period=clock_period_ns * 1e-9,
+            max_paths=max_paths,
+        )
+    return analyzer.analyze_framework(
+        net_manager=placer.net_manager,
+        logic_coords=logic_coords,
+        io_coords=io_coords,
+        include_io=include_io,
+        clock_period=clock_period_ns * 1e-9,
+    )
+
+
+def parse_vivado_timing(report_path: str) -> Optional[TimingSummary]:
+    """
+    Convenience function to parse a Vivado timing summary report.
+
+    Args:
+        report_path: Path to Vivado timing_summary.rpt
+
+    Returns:
+        TimingSummary or None if parsing failed.
+    """
+    analyzer = TimingAnalyzer()
+    return analyzer.parse_vivado_report(report_path)
+
+
+def analyze_path_based_timing(
+    design: Any,
+    placer: Any,
+    logic_coords: torch.Tensor,
+    io_coords: Optional[torch.Tensor] = None,
+    include_io: bool = False,
+    clock_period_ns: float = 5.0,
+    max_paths: int = 10000,
+) -> TimingSummary:
+    """
+    Convenience function for path-based (FF-to-FF) timing analysis.
+
+    Args:
+        design: RapidWright Design object (provides getCells(), getNets()).
+        placer: An FpgaPlacer instance.
+        logic_coords: Placed logic coordinates [N, 2].
+        io_coords: Placed IO coordinates [M, 2] (optional).
+        include_io: Whether to include IO in analysis.
+        clock_period_ns: Target clock period in nanoseconds.
+        max_paths: Maximum number of paths to trace.
+
+    Returns:
+        TimingSummary with actual path-based timing metrics.
+    """
+    analyzer = TimingAnalyzer(clock_period=clock_period_ns * 1e-9)
+    return analyzer.analyze_path_based(
+        design=design,
+        placer=placer,
+        logic_coords=logic_coords,
+        io_coords=io_coords,
+        include_io=include_io,
+        clock_period=clock_period_ns * 1e-9,
+        max_paths=max_paths,
+    )
+
+
+# =============================================================================
+# Vivado Feedback Mode — map FEM placement back to Vivado for exact timing
+# =============================================================================
 
-    def calculate_timing_violation_loss(self, p, area_width):
-        """
-        Calculate timing violation loss.
-
-        Args:
-            p: Probability distribution
-            area_width: Width of the placement area
-
-        Returns:
-            violation_loss: Average timing violation loss
-        """
-        path_delays = self.calculate_path_delays(p, area_width)
-
-        if not path_delays:
-            return 0.0
-
-        total_violation = 0.0
-        critical_path_count = 0
-
-        for path_info in path_delays:
-            slack = path_info['slack']
-            if isinstance(slack, torch.Tensor):
-                slack_val = slack.mean().item()
-            else:
-                slack_val = slack
-
-            if slack_val < 0:
-                violation = -slack_val * path_info['criticality']
-                total_violation += violation
-                critical_path_count += 1
-
-        return total_violation / len(path_delays) if path_delays else 0.0
-
-    def calculate_congestion_aware_hpwl(self, J_extended, p, area_width, congestion_map=None):
-        """
-        Calculate congestion-aware HPWL.
-
-        Args:
-            J_extended: Extended coupling matrix
-            p: Probability distribution
-            area_width: Width of the placement area
-            congestion_map: Pre-computed congestion map (optional)
-
-        Returns:
-            weighted_wirelength: Congestion-weighted wirelength
-        """
-        if congestion_map is None:
-            congestion_map = self.estimate_congestion(p, area_width)
-
-        batch_size = p.shape[0]
-        expected_coords = self.get_expected_placements_from_index(p, area_width)
-
-        J = torch.tensor(J_extended, dtype=torch.float32, device=p.device)
-        num_instances = J.shape[0]
-
-        coords_i = expected_coords.unsqueeze(2)
-        coords_j = expected_coords.unsqueeze(1)
-        manhattan_dist = torch.sum(torch.abs(coords_i - coords_j), dim=-1)
-
-        congestion_weights = self.calculate_congestion_weights(expected_coords, congestion_map)
-
-        # Element-wise multiply: manhattan_dist [batch, inst, inst], congestion_weights [batch, inst, inst], J [inst, inst]
-        weighted_dist = manhattan_dist * congestion_weights * J.unsqueeze(0)
-
-        triu_mask = torch.triu(torch.ones(num_instances, num_instances, device=p.device), diagonal=1).bool()
-        weighted_dist_triu = weighted_dist[:, triu_mask]
-
-        total_wirelength = torch.sum(weighted_dist_triu, dim=1)
-
-        return torch.mean(total_wirelength) / batch_size
-
-    def estimate_congestion(self, p, area_width):
-        """
-        Estimate placement congestion.
-
-        Args:
-            p: Probability distribution
-            area_width: Width of the placement area
-
-        Returns:
-            congestion_map: Congestion map [batch_size, area_width, area_width]
-        """
-        batch_size = p.shape[0]
-
-        site_usage = torch.sum(p, dim=1)
-
-        congestion_map = torch.zeros(batch_size, area_width, area_width, device=p.device)
-
-        for b in range(batch_size):
-            for loc_idx in range(site_usage.shape[1]):
-                x = loc_idx % area_width
-                y = loc_idx // area_width
-                if x < area_width and y < area_width:
-                    congestion_map[b, y, x] = site_usage[b, loc_idx]
-
-        return congestion_map
-
-    def calculate_congestion_weights(self, expected_coords, congestion_map):
-        """
-        Calculate congestion weights.
-
-        Args:
-            expected_coords: Expected placement coordinates
-            congestion_map: Congestion map
-
-        Returns:
-            congestion_weights: Congestion weight matrix
-        """
-        batch_size, num_instances, _ = expected_coords.shape
-        congestion_weights = torch.ones(batch_size, num_instances, num_instances,
-                                        device=expected_coords.device)
-
-        for b in range(batch_size):
-            for i in range(num_instances):
-                for j in range(i + 1, num_instances):
-                    coord_i = expected_coords[b, i].long()
-                    coord_j = expected_coords[b, j].long()
-
-                    path_congestion = self.calculate_path_congestion(
-                        coord_i, coord_j, congestion_map[b]
-                    )
-
-                    congestion_weights[b, i, j] = 1.0 + path_congestion
-                    congestion_weights[b, j, i] = 1.0 + path_congestion
-
-        return congestion_weights
-
-    def calculate_path_congestion(self, start, end, congestion_map):
-        """
-        Calculate average congestion along a path.
-
-        Args:
-            start: Start coordinates [2]
-            end: End coordinates [2]
-            congestion_map: Congestion map [height, width]
-
-        Returns:
-            avg_congestion: Average congestion value (float)
-        """
-        # Convert to Python ints if tensors
-        start_x = int(start[0].item()) if hasattr(start[0], 'item') else int(start[0])
-        start_y = int(start[1].item()) if hasattr(start[1], 'item') else int(start[1])
-        end_x = int(end[0].item()) if hasattr(end[0], 'item') else int(end[0])
-        end_y = int(end[1].item()) if hasattr(end[1], 'item') else int(end[1])
-
-        x_path = range(min(start_x, end_x), max(start_x, end_x) + 1)
-        y_path = range(min(start_y, end_y), max(start_y, end_y) + 1)
-
-        total_congestion = 0.0
-        point_count = 0
-
-        for x in x_path:
-            for y in y_path:
-                if x < congestion_map.shape[1] and y < congestion_map.shape[0]:
-                    val = congestion_map[y, x]
-                    total_congestion += val.item() if hasattr(val, 'item') else float(val)
-                    point_count += 1
-
-        return total_congestion / point_count if point_count > 0 else 0.0
-
-    def comprehensive_energy_function(self, J_extended, p, area_width, weights=None):
-        """
-        Calculate comprehensive energy function with all constraints.
-
-        Args:
-            J_extended: Extended coupling matrix
-            p: Probability distribution
-            area_width: Width of the placement area
-            weights: Weight dictionary for different components
-
-        Returns:
-            total_energy: Total energy value
-            losses: Dictionary of individual loss components
-        """
-        if weights is None:
-            weights = {
-                'hpwl': 1.0,
-                'timing': 5.0,
-                'congestion': 2.0,
-                'site_constraint': 10.0,
-                'type_constraint': 5.0
-            }
-
-        total_energy = 0.0
-
-        # Basic HPWL
-        hpwl_loss = self.calculate_timing_based_hpwl(J_extended, p, area_width, 0.0)
-        total_energy += weights['hpwl'] * hpwl_loss
-
-        # Timing constraint
-        timing_loss = self.calculate_timing_violation_loss(p, area_width)
-        total_energy += weights['timing'] * timing_loss
-
-        # Congestion-aware HPWL
-        congestion_loss = self.calculate_congestion_aware_hpwl(J_extended, p, area_width)
-        total_energy += weights['congestion'] * congestion_loss
-
-        losses = {
-            'hpwl_loss': hpwl_loss.item() if hasattr(hpwl_loss, 'item') else hpwl_loss,
-            'timing_loss': timing_loss if isinstance(timing_loss, float) else timing_loss.item(),
-            'congestion_loss': congestion_loss.item() if hasattr(congestion_loss, 'item') else congestion_loss,
-        }
-
-        return total_energy, losses
-
-    def optimize_with_all_constraints(self, J_extended, area_width, num_iterations=1000):
-        """
-        Optimize placement considering all constraints.
-
-        Args:
-            J_extended: Extended coupling matrix
-            area_width: Width of the placement area
-            num_iterations: Number of optimization iterations
-
-        Returns:
-            best_p: Best probability distribution found
-            best_energy: Best energy value
-        """
-        num_instances = len(self.optimizable_sites)
-        num_locations = len(self.available_target_sites)
-
-        h = torch.randn(1, num_instances, num_locations, requires_grad=True)
-        optimizer = torch.optim.Adam([h], lr=0.005)
-
-        best_energy = float('inf')
-        best_p = None
-
-        for iteration in range(num_iterations):
-            optimizer.zero_grad()
-
-            p = torch.softmax(h, dim=2)
-
-            total_energy, losses = self.comprehensive_energy_function(J_extended, p, area_width)
-
-            total_energy.backward()
-            optimizer.step()
-
-            if total_energy.item() < best_energy:
-                best_energy = total_energy.item()
-                best_p = p.detach().clone()
-
-            if iteration % 100 == 0:
-                print(f"Iter {iteration}: "
-                      f"Total={total_energy.item():.3f}, "
-                      f"HPWL={losses['hpwl_loss']:.3f}, "
-                      f"Timing={losses['timing_loss']:.3f}, "
-                      f"Congestion={losses['congestion_loss']:.3f}")
-
-        return best_p, best_energy
-
-    def analyze_timing_closure(self, p, area_width):
-        """
-        Analyze timing closure.
-
-        Args:
-            p: Probability distribution
-            area_width: Width of the placement area
-
-        Returns:
-            timing_info: Dictionary with timing closure information
-        """
-        path_delays = self.calculate_path_delays(p, area_width)
-
-        timing_info = {
-            'total_paths': len(path_delays),
-            'violating_paths': 0,
-            'worst_slack': float('inf'),
-            'total_slack': 0.0
-        }
-
-        for path in path_delays:
-            slack = path['slack']
-            if isinstance(slack, torch.Tensor):
-                slack_val = slack.mean().item()
-            else:
-                slack_val = slack
-
-            if slack_val < 0:
-                timing_info['violating_paths'] += 1
-            timing_info['worst_slack'] = min(timing_info['worst_slack'], slack_val)
-            timing_info['total_slack'] += slack_val
-
-        timing_info['avg_slack'] = (timing_info['total_slack'] / len(path_delays)
-                                    if path_delays else 0)
-
-        return timing_info

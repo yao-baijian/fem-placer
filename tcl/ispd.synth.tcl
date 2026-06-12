@@ -1,6 +1,8 @@
-set synth_dcp "/home/byao/Desktop/fem_rev/fem/benchmarks/ISPD/FPGA-example3/design.dcp"  ;# 综合后的DCP
-set output_dir "/home/byao/Desktop/fem_rev/fem/vivado/output_dir/FPGA-example3"         ;# 输出目录
+set synth_dcp "D:/Project/fem-placer-latest/fem-placer/benchmarks/ISPD/FPGA-example2/design.dcp"  ;# 综合后的DCP
+set output_dir "D:/Project/fem-placer-latest/fem-placer/vivado/output_dir/FPGA-example2"         ;# 输出目录
 set impl_dcp [file join $output_dir "post_impl.dcp"]                                  ;# 实现后的DCP
+
+file mkdir $output_dir
 
 open_checkpoint $synth_dcp
 
@@ -15,7 +17,8 @@ set fp [open [file join $output_dir "place_time.txt"] w]
 puts $fp $place_time
 close $fp
 
-phys_opt_design -force_replication_on_nets ;# 降低扇出
+# phys_opt_design -force_replication 
+# 降低扇出
 
 route_design -directive NoTimingRelaxation
 

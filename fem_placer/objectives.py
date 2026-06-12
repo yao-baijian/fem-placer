@@ -14,6 +14,7 @@ Key functions:
 
 import torch
 import torch.nn.functional as Func
+from typing import Dict
 from .logger import *
 
 # Global history tracking for optimization visualization
@@ -316,6 +317,64 @@ def get_constraints_loss_with_io(p_logic, p_io, alpha, beta):
     return alpha * logic_constraint + beta * io_constraint
 
 # 
+
+# =============================================================================
+# N-Region Generalised Objective (CLB + IO + DSP + …)
+# =============================================================================
+
+def get_hpwl_loss_qubo_with_regions(
+    region_ps: Dict[str, torch.Tensor],
+    region_coupling: Dict[str, Dict[str, torch.Tensor]],
+    region_distances: Dict[str, Dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    """
+    Generalised HPWL loss for N regions.
+
+    ``region_ps`` maps region name → probability tensor ``[B, N_i, M_i]``.
+    ``region_coupling`` maps ``(rA, rB)`` → coupling matrix ``[N_A, N_B]``.
+    ``region_distances`` maps ``(rA, rB)`` → distance matrix ``[M_A, M_B]``.
+
+    Returns total wirelength ``[B]``.
+    """
+    total_wl = 0
+    for rA in region_ps:
+        pA = region_ps[rA]
+        for rB in region_ps:
+            J = region_coupling.get(rA, {}).get(rB)
+            D = region_distances.get(rA, {}).get(rB)
+            if J is None or D is None or J.numel() == 0:
+                continue
+            pB = region_ps[rB]
+            PD = torch.matmul(pA, D)
+            pBT = pB.transpose(1, 2)
+            E = torch.bmm(PD, pBT)
+            wl = torch.sum(E * J.unsqueeze(0), dim=(1, 2))
+            factor = 0.5 if rA == rB else 1.0
+            total_wl = total_wl + factor * wl
+    return total_wl
+
+
+def get_constraints_loss_with_regions(
+    region_ps: Dict[str, torch.Tensor],
+    alphas: Dict[str, float],
+) -> torch.Tensor:
+    """Constraint loss for N regions.  ``alphas`` maps region -> penalty weight."""
+    total = 0
+    for r, p in region_ps.items():
+        usage = torch.sum(p, dim=1)
+        coeff = p.shape[1] / 2.0 if r != 'io' else p.shape[1] / 20.0
+        penalty = torch.sum(coeff * Func.softplus(usage - 1)**2, dim=1)
+        total = total + alphas.get(r, 1.0) * penalty
+    return total
+
+
+def expected_fpga_placement_with_regions(
+    region_ps, region_coupling, region_distances, alphas):
+    """Combined HPWL + constraint loss for N regions."""
+    hpwl = get_hpwl_loss_qubo_with_regions(region_ps, region_coupling, region_distances)
+    constrain = get_constraints_loss_with_regions(region_ps, alphas)
+    return hpwl + constrain
+
 
 # =============================================================================
 # Manual Gradient Functions
@@ -1040,3 +1099,35 @@ def infer_placements_with_io(J_LL, J_LI,
                                         p_logic, p_io, 
                                         D_LL, D_LI)
     return [logic_inst_coords, io_inst_coords], result
+
+
+def infer_placements_with_regions(
+    region_ps: Dict[str, torch.Tensor],
+    region_site_coords: Dict[str, torch.Tensor],
+    region_coupling: Dict[str, Dict[str, torch.Tensor]],
+    region_distances: Dict[str, Dict[str, torch.Tensor]],
+) -> tuple:
+    """
+    Infer final placements for N regions from probability distributions.
+
+    Args:
+        region_ps: Region name → probability tensor [B, N_i, M_i]
+        region_site_coords: Region name → site coords [M_i, 2]
+        region_coupling: (rA, rB) → coupling matrix [N_A, N_B]
+        region_distances: (rA, rB) → distance matrix [M_A, M_B]
+
+    Returns:
+        coords: Dict[r] → instance coords [B, N_i, 2]
+        hpwl: HPWL values [B]
+    """
+    coords = {}
+    for r, p in region_ps.items():
+        inst_indices = torch.argmax(p, dim=2)
+        coords[r] = region_site_coords[r][inst_indices]
+
+        overlap, _, _ = count_duplicate_coords(coords[r])
+        if overlap > 0:
+            INFO(f"  {r} overlap: {overlap}")
+
+    result = get_hpwl_loss_qubo_with_regions(region_ps, region_coupling, region_distances)
+    return coords, result

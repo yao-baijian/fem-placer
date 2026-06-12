@@ -25,35 +25,54 @@ from com.xilinx.rapidwright.rwroute import RWRoute
 class FpgaPlacer:
 
     def __init__(self, 
+                 config=None,
                  place_orientation = PlaceType.CENTERED, 
                  grid_type = GridType.SQUARE,
                  place_mode = IoMode.NORMAL,
                  utilization_factor = 0.3,
                  debug = True,
                  device = 'cpu',
-                 record_mode = 'inverse_sqr', #simple, inverse, inverse_sqr, inverse_log, degree_inverse, no
-                 map_mode = 'no',  #simple, avg, log, no
-                 net_offset_coeff: float = 1.0, #-1, 0, 1
+                 record_mode = 'inverse_sqr',
+                 map_mode = 'no', 
+                 net_offset_coeff: float = 1.0,
                  hpwl_workers = None,
                  hpwl_parallel_threshold = 4):
         
+        # If a config object is given, pull parameters from it
+        if config is not None:
+            regions = getattr(config, 'regions', ['logic', 'io'])
+            raw_gt = getattr(config, 'grid_type', None)
+            if raw_gt is not None:
+                grid_type = raw_gt if isinstance(raw_gt, GridType) else GridType[raw_gt]
+            raw_pm = getattr(config, 'place_mode', None)
+            if raw_pm is not None:
+                place_mode = raw_pm if isinstance(raw_pm, IoMode) else IoMode[raw_pm]
+            utilization_factor = getattr(config, 'utilization_factor', utilization_factor)
+            verbose = getattr(config, 'verbose', debug)
+            device = getattr(config, 'dev', device)
+            record_mode = getattr(config, 'record_mode', record_mode)
+            map_mode = getattr(config, 'map_mode', map_mode)
+            net_offset_coeff = getattr(config, 'net_offset_coeff', net_offset_coeff)
+            hpwl_workers = getattr(config, 'hpwl_workers', hpwl_workers)
+            hpwl_parallel_threshold = getattr(config, 'hpwl_parallel_threshold', hpwl_parallel_threshold)
+        else:
+            regions = ['logic', 'io']
+
+        self.regions = regions
         self.total_insts_num = 0
         self.other_insts_num = 0
 
-        self.instances = {
-                'logic': InstanceGroup('logic', device),
-                'io': InstanceGroup('io', device),
-                'clock': InstanceGroup('clock', device),
-                'sites': InstanceGroup('sites', device)
-        }
-
-        self.cells = []
-        
-        self.grids = {
-            'logic': Grid(name='logic', device=device),
-            'io': HollowGrid(name='io', device=device) if place_mode == IoMode.VIRTUAL_NODE else Grid(name='io', device=device),
-            'clock': Grid(name='clock', device=device)
-        }
+        # Auto-create instance groups and grids for declared regions
+        self.instances = {}
+        self.grids = {}
+        for r in regions:
+            self.instances[r] = InstanceGroup(r, device)
+            if r == 'io' and place_mode == IoMode.VIRTUAL_NODE:
+                self.grids[r] = HollowGrid(name=r, device=device)
+            else:
+                self.grids[r] = Grid(name=r, device=device)
+        # Always create clock and sites
+        self.instances['sites'] = InstanceGroup('sites', device)
 
         self.unfixed_placements = {}
         self.fixed_placements = {}
@@ -157,22 +176,24 @@ class FpgaPlacer:
                 pass
         
     def get_site_inst_id_by_name(self, site_name):
-        if self.instances['logic'].has_name(site_name):
-            return self.instances['logic'].get_id(site_name)
-        elif self.instances['io'].has_name(site_name):
-            return self.instances['io'].get_id(site_name) + self.instances['logic'].num
-        else:
-            WARNING(f"Cannot find site_inst id for site_name: {site_name}")
-            return None
+        # Dynamic region-aware lookup — iterate declared regions in order
+        # Note: create_mappings already assigns globally-unique IDs with offsets,
+        # so get_id() already returns the final global ID — do NOT add offset again.
+        for r in self.regions:
+            if self.instances[r].has_name(site_name):
+                return self.instances[r].get_id(site_name)
+        WARNING(f"Cannot find site_inst id for site_name: {site_name}")
+        return None
         
     def get_inst_name_by_id(self, id):
-        if self.instances['logic'].has_id(id):
-            return self.instances['logic'].get_name(id)
-        elif self.instances['io'].has_id(id - self.instances['logic'].num):
-            return self.instances['io'].get_name(id - self.instances['logic'].num)
-        else:
-            WARNING(f"Cannot find site_inst name for id: {id}")
-            return None
+        # Dynamic region-aware lookup — iterate declared regions in order
+        offset = 0
+        for r in self.regions:
+            if self.instances[r].has_id(id - offset):
+                return self.instances[r].get_name(id - offset)
+            offset += self.instances[r].num
+        WARNING(f"Cannot find site_inst name for id: {id}")
+        return None
 
     def get_site_id_by_name(self, site_name):
         return self.instances['sites'].name_to_id.get(site_name)
@@ -187,11 +208,18 @@ class FpgaPlacer:
                 site_type = site_inst.getSiteTypeEnum()
                 if site_type in SLICE_SITE_ENUM:
                     self.instances['logic'].add(site_inst)
+                elif site_type in DSP_SITE_ENUM:
+                    if 'dsp' in self.instances:
+                        self.instances['dsp'].add(site_inst)
+                    else:
+                        continue
                 elif site_type in IO_SITE_ENUM:
                     self.instances['io'].add(site_inst)
                 elif site_type in OTHER_SITE_ENUM:
                     continue
-                elif site_inst not in self.instances['logic'].insts and site_inst not in self.instances['io'].insts:
+                elif site_inst not in self.instances['logic'].insts and \
+                     ('dsp' not in self.instances or site_inst not in self.instances['dsp'].insts) and \
+                     site_inst not in self.instances['io'].insts:
                     WARNING(f"Site {site_inst.getName()} with type {site_type} is not classified as optimizable or fixed.")
         # 2. Collect instances boundary node as virtual (IO), used in module run
         elif self.place_mode == IoMode.VIRTUAL_NODE:
@@ -223,31 +251,41 @@ class FpgaPlacer:
                 else:
                     WARNING(f'Cannot orient site type, site: {site_inst.getName()}, type: {site_type}')
     
-    def get_available_target_sites(self, device):        
+    def get_available_target_sites(self, device):
+        logic_grid = self.grids['logic']
         for site in device.getAllSites():
             site_x = site.getInstanceX()
             site_y = site.getInstanceY()
             
-            if (self.grids['logic'].start_x <= site_x <= self.grids['logic'].end_x and 
-                self.grids['logic'].start_y <= site_y <= self.grids['logic'].end_y ):
-                
+            if (logic_grid.start_x <= site_x <= logic_grid.end_x and
+                logic_grid.start_y <= site_y <= logic_grid.end_y):
+
                 site_type = site.getSiteTypeEnum()
 
                 if site_type in SLICE_SITE_ENUM:
                     self.instances['sites'].add(site)
-        
+                elif site_type in DSP_SITE_ENUM:
+                    # Only track DSP sites if the 'dsp' region is active
+                    if 'dsp_sites' not in self.instances:
+                        self.instances['dsp_sites'] = InstanceGroup('dsp_sites', self.device)
+                    self.instances['dsp_sites'].add(site)
+
         if self.instances['sites'].num < self.instances['logic'].num:
-            WARNING(f"Available sites({self.instances['sites'].num}) less than optimizable sites({self.instances['logic'].num})")
-            # TODO add sites here
+            WARNING(f"Available sites({self.instances['sites'].num}) less than logic sites({self.instances['logic'].num})")
         
     def get_ids(self):
-        return self.instances['logic'].ids, self.instances['io'].ids
+        return tuple(self.instances[r].ids for r in self.regions)
 
     def _map_site_to_id(self):
-
-        offset = self.instances['logic'].create_mappings(0)
-        self.instances['io'].create_mappings(0)
+        offset = 0
+        for r in self.regions:
+            offset = self.instances[r].create_mappings(offset)
+        # Target sites — always create for 'sites' and each region's _sites
         self.instances['sites'].create_mappings(0)
+        for r in self.regions:
+            sname = r + '_sites'
+            if sname in self.instances:
+                self.instances[sname].create_mappings(0)
         
         if self.debug:
         # Write debug files
@@ -267,10 +305,13 @@ class FpgaPlacer:
 
     def _init_place_areas(self, design):
         self.total_insts_num = len(design.getSiteInsts())
-        self.other_insts_num = self.total_insts_num - (self.instances['logic'].num + self.instances['io'].num)
+        classified = sum(self.instances[r].num for r in self.regions if r in self.instances)
+        self.other_insts_num = self.total_insts_num - classified
         self.constraint_alpha = self.instances['logic'].num / 2
 
-        INFO(f"Sites stat: {self.instances['logic'].num} slice sites, {self.instances['io'].num} fixed sites, {self.other_insts_num} other sites, total {self.total_insts_num} sites.")
+        stat_parts = ' + '.join(f"{self.instances[r].num} {r}" for r in self.regions if r in self.instances)
+        INFO(f"Sites stat: {stat_parts}, {self.other_insts_num} other, "
+             f"total {self.total_insts_num} sites.")
         
         if self.place_mode == IoMode.VIRTUAL_NODE:
             dim_file = os.path.join(self.result_dir, self.instance_name, 'io_dimensions.txt')
@@ -332,7 +373,20 @@ class FpgaPlacer:
         
         utilization = self.instances['logic'].num / (area_length * area_height)
         
-        INFO(f"Estimate area {area_length} x {area_height} , start=({start_x}, {start_y}), end=({end_x}, {end_y}), utilization {utilization:.3f}")
+        INFO(f"Logic grid {area_length} x {area_height}, start=({start_x}, {start_y}), utilization {utilization:.3f}")
+
+        # --- DSP grid: place DSPs below the logic grid (if 'dsp' region is present) ---
+        if 'dsp' in self.instances and 'dsp' in self.grids:
+            dsp_grid = self.grids['dsp']
+            dsp_grid.start_x = start_x
+            dsp_grid.start_y = start_y - max(1, self.instances['dsp'].num)
+            dsp_grid.area_length = max(1, area_length)
+            dsp_grid.area_width = max(1, self.instances['dsp'].num)
+            dsp_grid.__post_init__()
+
+            if self.instances['dsp'].num > dsp_grid.area:
+                ERROR(f"DSP instances num ({self.instances['dsp'].num}) exceeds DSP grid area ({dsp_grid.area})")
+            INFO(f"DSP grid {dsp_grid.area_length} x {dsp_grid.area_width}, start=({dsp_grid.start_x}, {dsp_grid.start_y})")
 
     def _init_io_area(self):
         
@@ -487,6 +541,7 @@ class FpgaPlacer:
         with self.suppress_rapidwright_output():
             design = Design.readCheckpoint(dcp_file)
         INFO(f"Reading DCP: {dcp_file} success")
+        self.design = design  # Keep the Design object for downstream use (path-based timing, Vivado feedback)
         # routing report
         # design.unrouteDesign()
 
@@ -502,7 +557,8 @@ class FpgaPlacer:
         self.classify_instances(design)
         self._init_place_areas(design)
         self._init_io_area()
-        self._init_clock_buffer_area()
+        if 'clock' in self.instances:
+            self._init_clock_buffer_area()
         self.get_available_target_sites(device)
         self._map_site_to_id()
         vivado_hpwl = self.net_manager.analyze_design_hpwl(design, 
@@ -512,14 +568,14 @@ class FpgaPlacer:
                                                 self.instances['io'])
         # self.random_initial_placement(design)
         
-        self._get_logic_area_coords()
-        self._get_io_area_coords()
+        # Generate region coordinate tensors
+        for r in self.regions:
+            getter = getattr(self, f'_get_{r}_area_coords', None)
+            if getter is not None:
+                getter()
         self._get_combined_coords()
 
-        inst_num = {
-            'logic_inst_num': self.instances['logic'].num,
-            'io_inst_num': self.instances['io'].num
-            }
+        inst_num = {f'{r}_inst_num': self.instances[r].num for r in self.regions}
 
         return vivado_hpwl, inst_num, net_num
 
@@ -563,18 +619,21 @@ class FpgaPlacer:
         INFO(f"Saved init parameters to {output_path}")
         return output_path
 
-    def map_coords_to_instance(self, coords, io_coords=None, include_io=False):
+    def map_coords_to_instance(self, *region_coords):
+        """Map region coordinates to instance names.
+        
+        Args:
+            *region_coords: One tensor per region, in the order of ``self.regions``.
+        """
         instance_coords = {}
-        
-        for instance_id in range(len(coords)):
-            site_name = self.get_inst_name_by_id(instance_id)
-            instance_coords[site_name] = coords[instance_id]
-
-        if include_io:
-            for instance_id in range(len(io_coords)):
-                site_name = self.get_inst_name_by_id(instance_id + self.instances['logic'].num)
-                instance_coords[site_name] = io_coords[instance_id]
-        
+        offset = 0
+        for r, coords in zip(self.regions, region_coords):
+            if coords is None:
+                continue
+            for instance_id in range(len(coords)):
+                site_name = self.get_inst_name_by_id(instance_id + offset)
+                instance_coords[site_name] = coords[instance_id]
+            offset += self.instances[r].num
         return instance_coords
         
     def _get_logic_area_coords(self):
@@ -586,11 +645,13 @@ class FpgaPlacer:
             torch.arange(place_width, dtype=torch.float32, device=self.device)
         ))
 
-    # def get_site_coords_all(num_locations, area_width):
-    #     indices = torch.arange(num_locations, dtype=torch.float32, device='cuda')
-    #     x_coords = indices % area_width
-    #     y_coords = indices // area_width
-    #     return torch.stack([x_coords, y_coords], dim=1)
+    def _get_dsp_area_coords(self):
+        dsp_grid = self.grids['dsp']
+        
+        self.dsp_site_coords = self.grids['dsp'].to_real_coords_tensor(torch.cartesian_prod(
+            torch.arange(dsp_grid.area_length, dtype=torch.float32, device=self.device),
+            torch.arange(dsp_grid.area_width, dtype=torch.float32, device=self.device)
+        ))
 
     def _get_io_area_coords(self):
         if self.place_mode == IoMode.VIRTUAL_NODE:
@@ -606,21 +667,24 @@ class FpgaPlacer:
             ))
         
     def _get_combined_coords(self):
-        logic_coords = self.logic_site_coords.clone()
-        adjusted_io_coords = self.io_site_coords.clone()
-        
-        place_height = self.grids['logic'].area_width
-        io_height = self.grids['io'].area_width
-    
-        logic_center_y = (place_height - 1) / 2.0
-        io_center_y = (io_height - 1) / 2.0 
-        
-        y_offset = logic_center_y - io_center_y
-
-        adjusted_io_coords[:, 0] = -1.0 
-        adjusted_io_coords[:, 1] += y_offset
-        
-        self.site_coords_all = torch.cat([logic_coords, adjusted_io_coords], dim=0)
+        tensors = []
+        for r in self.regions:
+            attr = f'{r}_site_coords'
+            if hasattr(self, attr):
+                tensors.append(getattr(self, attr).clone())
+        # IO coords may need Y-offset alignment (always last in regions)
+        if 'io' in self.regions and hasattr(self, 'io_site_coords'):
+            io_coords = self.io_site_coords.clone()
+            place_height = self.grids['logic'].area_width
+            io_height = self.grids['io'].area_width
+            logic_center_y = (place_height - 1) / 2.0
+            io_center_y = (io_height - 1) / 2.0
+            io_coords[:, 0] = -1.0
+            io_coords[:, 1] += logic_center_y - io_center_y
+            # Replace the raw io coords in tensors with adjusted version
+            io_idx = self.regions.index('io')
+            tensors[io_idx] = io_coords
+        self.site_coords_all = torch.cat(tensors, dim=0) if tensors else None
         
     def place(self, coords, io_coords=None, include_io=False):
         # TODO replace the legalized logic into FPGA

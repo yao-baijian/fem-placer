@@ -20,6 +20,8 @@ class IoMode(Enum):
 
 SLICE_SITE_ENUM = [SiteTypeEnum.SLICEL, SiteTypeEnum.SLICEM]
 
+DSP_SITE_ENUM = [SiteTypeEnum.DSP48E2]
+
 IO_SITE_ENUM = [
     SiteTypeEnum.HPIOB,
     SiteTypeEnum.HRIO
@@ -28,7 +30,13 @@ IO_SITE_ENUM = [
 # CLOCK_SITE_ENUM = [SiteTypeEnum.BUFGCE]
 
 OTHER_SITE_ENUM = [SiteTypeEnum.BUFGCE, 
-                   SiteTypeEnum.DSP48E2, 
                    SiteTypeEnum.RAMB36, 
                    SiteTypeEnum.RAMB180, 
-                   SiteTypeEnum.BITSLICE_COMPONENT_RX_TX,]
+                   SiteTypeEnum.BITSLICE_COMPONENT_RX_TX,                   
+                   SiteTypeEnum.HPIOB_S,
+                   SiteTypeEnum.HPIOB_M,
+                   SiteTypeEnum.HPIOB_SNGL,
+                   SiteTypeEnum.HDIOLOGIC_M,
+                   SiteTypeEnum.HDIOLOGIC_S,
+                   SiteTypeEnum.HDIOB_M,
+                   SiteTypeEnum.HDIOB_S]

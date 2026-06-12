@@ -1,8 +1,23 @@
 
 set benchmarks {
-    bgm /home/byao/Desktop/fem_rev/fem/benchmarks/vtr/verilog/bgm.v
-    RLE_BlobMerging /home/byao/Desktop/fem_rev/fem/benchmarks/vtr/verilog/blob_merge.v
-    sha1 /home/byao/Desktop/fem_rev/fem/benchmarks/vtr/verilog/sha.v
+    bgm D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/bgm.v
+    RLE_BlobMerging D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/blob_merge.v
+    paj_boundtop_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/boundtop.v
+    memory_controller D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/ch_intrinsics.v
+    diffeq_paj_convert D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/diffeq1.v
+    diffeq_f_systemC D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/diffeq2.v
+    LU8PEEng D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/LU8PEEng.v
+    LU32PEEng D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/LU32PEEng.v
+    mcml D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/mcml.v
+    mkPktMerge D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/mkPktMerge.v
+    mkSMAdapter4B D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/mkSMAdapter4B.v
+    or1200_flat D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/or1200.v
+    paj_raygentop_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/raygentop.v
+    sha1 D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/sha.v
+    sv_chip0_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/stereovision0.v
+    sv_chip1_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/stereovision1.v
+    sv_chip2_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/stereovision2.v
+    sv_chip3_hierarchy_no_mem D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/stereovision3.v
 }
 
 # bgm /home/byao/Desktop/fem_rev/fem/benchmarks/vtr/verilog/bgm.v
@@ -45,12 +60,12 @@ foreach {top_module rtl_file} $benchmarks {
     
     # Create project
     create_project -part $part_name -force $top_module $temp_project_dir
-    add_files -norecurse $rtl_file /home/byao/Desktop/fem_rev/fem/benchmarks/vtr/verilog/vtr_primitives.v
+    add_files -norecurse $rtl_file D:/Project/fem-placer-latest/fem-placer/benchmarks/vtr/vtr_primitives.v
     set_property top $top_module [current_fileset]
     
     # Synthesis
     puts "Running synthesis for $top_module..."
-    synth_design -top $top_module -part $part_name -flatten_hierarchy rebuilt -mode out_of_context
+    synth_design -top $top_module -part $part_name -flatten_hierarchy rebuilt
     write_checkpoint -force [file join $output_dir post_synth.dcp]
     
     # Optimization
