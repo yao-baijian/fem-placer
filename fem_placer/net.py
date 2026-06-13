@@ -350,7 +350,7 @@ class NetManager:
     def analyze_nets(self, logic_instances, io_instances):
 
         logic_insts_num = logic_instances.num
-        io_insts_num = io_instances.num
+        io_insts_num = io_instances.num if io_instances is not None else 0
 
         self.net_names = [net.getName() for net in self.nets]
         sites_net_list = []
@@ -359,7 +359,7 @@ class NetManager:
 
         # Pre-build lookup sets for O(1) site classification
         logic_name_set = set(logic_instances.name_to_id.keys())
-        io_name_set = set(io_instances.name_to_id.keys())
+        io_name_set = set(io_instances.name_to_id.keys()) if io_instances is not None else set()
         # Use defaultdict for site_to_nets to avoid repeated membership tests
         self.site_to_nets = defaultdict(list)
 

@@ -328,9 +328,10 @@ def format_result_row(
     hpwl_final_key = 'hpwl' if include_io else 'hpwl_no_io'
     hpwl_viv_key = 'hpwl' if include_io else 'hpwl_no_io'
 
+    io_inst_val = inst_num.get('io_inst_num', 0)
     return (
         f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} "
-        f"{inst_num['io_inst_num']:<6} {net_ratio:<14} {overlap:<8} "
+        f"{io_inst_val:<6} {net_ratio:<14} {overlap:<8} "
         f"{used_alpha:<8.2f} {used_beta:<8.2f} "
         f"{fem_hpwl_initial.get(hpwl_init_key, 0):<18.2f} "
         f"{fem_hpwl_final.get(hpwl_final_key, 0):<16.2f} "

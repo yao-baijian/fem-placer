@@ -214,12 +214,13 @@ class FpgaPlacer:
                     else:
                         continue
                 elif site_type in IO_SITE_ENUM:
-                    self.instances['io'].add(site_inst)
+                    if 'io' in self.instances:
+                        self.instances['io'].add(site_inst)
                 elif site_type in OTHER_SITE_ENUM:
                     continue
                 elif site_inst not in self.instances['logic'].insts and \
                      ('dsp' not in self.instances or site_inst not in self.instances['dsp'].insts) and \
-                     site_inst not in self.instances['io'].insts:
+                     ('io' not in self.instances or site_inst not in self.instances['io'].insts):
                     WARNING(f"Site {site_inst.getName()} with type {site_type} is not classified as optimizable or fixed.")
         # 2. Collect instances boundary node as virtual (IO), used in module run
         elif self.place_mode == IoMode.VIRTUAL_NODE:
@@ -245,7 +246,8 @@ class FpgaPlacer:
                 is_boundary = site_inst.getSiteName() in io_site_names
                 
                 if is_boundary:
-                    self.instances['io'].add(site_inst)
+                    if 'io' in self.instances:
+                        self.instances['io'].add(site_inst)
                 elif site_type in SLICE_SITE_ENUM:
                     self.instances['logic'].add(site_inst)
                 else:
@@ -296,12 +298,13 @@ class FpgaPlacer:
                     f.write(f"Optimizable\t{site_name}\t{idx}\n")
                 f.write(f"TOTAL\t{len(self.instances['logic'])}\n\n")
                 
-            with open(self.get_debug_output_path('io_inst_mapping_debug.tsv'), 'w') as f:
-                f.write("Type\tSiteInst_Name\tID\n")
-                for idx, inst in enumerate(self.instances['io'].insts):
-                    site_name = inst.getName()
-                    f.write(f"Fixed\t{site_name}\t{idx + offset}\n")
-                f.write(f"TOTAL\t{len(self.instances['io'])}\n\n")
+            if 'io' in self.instances:
+                with open(self.get_debug_output_path('io_inst_mapping_debug.tsv'), 'w') as f:
+                    f.write("Type\tSiteInst_Name\tID\n")
+                    for idx, inst in enumerate(self.instances['io'].insts):
+                        site_name = inst.getName()
+                        f.write(f"Fixed\t{site_name}\t{idx + offset}\n")
+                    f.write(f"TOTAL\t{len(self.instances['io'])}\n\n")
 
     def _init_place_areas(self, design):
         self.total_insts_num = len(design.getSiteInsts())
@@ -313,7 +316,7 @@ class FpgaPlacer:
         INFO(f"Sites stat: {stat_parts}, {self.other_insts_num} other, "
              f"total {self.total_insts_num} sites.")
         
-        if self.place_mode == IoMode.VIRTUAL_NODE:
+        if self.place_mode == IoMode.VIRTUAL_NODE and 'io' in self.grids:
             dim_file = os.path.join(self.result_dir, self.instance_name, 'io_dimensions.txt')
             if os.path.exists(dim_file):
                 with open(dim_file, 'r') as f:
@@ -349,7 +352,7 @@ class FpgaPlacer:
             area_height = 0
             
         # Optional override for Virtual Node mode to align logic grid to physical bounded area
-        if self.place_mode == IoMode.VIRTUAL_NODE:
+        if self.place_mode == IoMode.VIRTUAL_NODE and 'io' in self.grids:
             thickness = self.grids['io'].thick
             start_x = thickness
             end_x = start_x + area_length
@@ -510,7 +513,7 @@ class FpgaPlacer:
                 ERROR(f"No more site for {site.getName()}")
 
         # Fixed sites
-        for fixed_site in self.instances['io'].insts:
+        for fixed_site in (self.instances['io'].insts if 'io' in self.instances else []):
             self.fixed_placements[fixed_site.getName()] = {
                 'target_site': None,
                 'target_site': fixed_site,
@@ -556,16 +559,17 @@ class FpgaPlacer:
         self.cells = design.getCells()
         self.classify_instances(design)
         self._init_place_areas(design)
-        self._init_io_area()
+        if 'io' in self.instances:
+            self._init_io_area()
         if 'clock' in self.instances:
             self._init_clock_buffer_area()
         self.get_available_target_sites(device)
         self._map_site_to_id()
         vivado_hpwl = self.net_manager.analyze_design_hpwl(design, 
                                                 logic_instances=self.instances['logic'],
-                                                io_instances=self.instances['io'])
+                                                io_instances=self.instances.get('io'))
         net_num = self.net_manager.analyze_nets(self.instances['logic'], 
-                                                self.instances['io'])
+                                                self.instances.get('io'))
         # self.random_initial_placement(design)
         
         # Generate region coordinate tensors
@@ -585,9 +589,9 @@ class FpgaPlacer:
         
         params = {
             'num_inst': self.instances['logic'].num,
-            'num_fixed_inst': self.instances['io'].num,
+            'num_fixed_inst': self.instances['io'].num if 'io' in self.instances else 0,
             'num_site': self.grids['logic'].area,
-            'num_fixed_site': self.grids['io'].area,
+            'num_fixed_site': self.grids['io'].area if 'io' in self.grids else 0,
             'logic_grid_width': self.grids['logic'].area_width,
             'constraint_alpha': self.constraint_alpha,
             'constraint_beta': self.constraint_beta,

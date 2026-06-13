@@ -368,7 +368,7 @@ class TimingAnalyzer:
         io_coords: Optional[torch.Tensor] = None,
         include_io: bool = False,
         clock_period: Optional[float] = None,
-        max_paths: int = 10000,
+        max_paths: int = 0,
     ) -> TimingSummary:
         """
         Perform path-based timing analysis by tracing actual FF-to-FF paths
@@ -385,7 +385,7 @@ class TimingAnalyzer:
             io_coords: Placed IO instance coordinates [M, 2] (optional).
             include_io: Whether to include IO in analysis.
             clock_period: Override target clock period (seconds).
-            max_paths: Maximum number of paths to analyze (limits runtime).
+            max_paths: Maximum number of paths (0 = unlimited).
 
         Returns:
             TimingSummary with actual path-based timing metrics.
@@ -416,319 +416,315 @@ class TimingAnalyzer:
         INFO(f"  [path_timing] coord lookup: {len(site_to_coord)} sites, {_time.time()-_t0:.1f}s")
 
         # ------------------------------------------------------------------
-        # 2. Build site_name -> BEL classification from the physical device
+        # 2. Build logical-level cell connectivity via EDIF netlist
         # ------------------------------------------------------------------
-        # Instead of using Cell objects (which we can't map to pins), we
-        # classify each BEL (Basic Element of Logic) by its name:
-        #
-        #   BEL name contains "FF"/"REG"  → is_ff_bel
-        #   BEL name contains "LUT"/"CARRY"/"MUX" → is_combo_bel
-        #
-        # The node ID for each BEL is f"{site_name}/{bel_name}".
-        # We also build a set of site pins that are FF D/Q pins so we can
-        # identify FF boundaries during net traversal.
+        # Each physical Cell has a logical EDIFCellInst.  EDIF nets connect
+        # EDIF cell ports — no MUXes, no SitePIPs.  We classify cells by
+        # their type string (FDRE -> FF, LUT6 -> combo, etc.) and trace
+        # FF -> LUT -> FF paths at the logical level, then map back to
+        # physical placement for wire delay.
 
-        is_ff_bel: Dict[str, bool] = {}       # bel_id -> True if FF
-        is_combo_bel: Dict[str, bool] = {}    # bel_id -> True if combo
-        bel_to_site: Dict[str, str] = {}      # bel_id -> site_name
+        # Step 2a: Build cell name -> (type, site_name) lookup.
+        # KEY INSIGHT: Vivado renames cells between EDIF and physical netlists.
+        # The EDIF instance name is "DFF_0" but the physical cell name is
+        # "DFF_0/Q_reg".  We key by BOTH names so lookups from logical nets
+        # (which use EDIF names) and from physical nets both work.
+        cell_info: Dict[str, tuple] = {}
+        cell_type_counts: Dict[str, int] = {}
 
-        # Collect all unique (site, BEL) pairs from the design
         for cell in design.getCells():
+            ctype = str(cell.getType())
+            cell_type_counts[ctype] = cell_type_counts.get(ctype, 0) + 1
             si = cell.getSiteInst()
-            if si is None:
+            sname = str(si.getName()) if si is not None else ''
+            phys_name = str(cell.getName())
+            # Always store by physical cell name
+            cell_info[phys_name] = (ctype, sname)
+            # Also store by EDIF instance name if available
+            ec = cell.getEDIFCellInst()
+            if ec is not None:
+                edif_name = str(ec.getName())
+                if edif_name != phys_name:
+                    cell_info[edif_name] = (ctype, sname)
+
+        def _ctype(ct: str) -> tuple:
+            ct_up = ct.upper()
+            is_ff = ct_up.startswith('FD') or 'FF' in ct_up or ct_up in ('RAM32X1S',)
+            is_lut = ct_up.startswith('LUT') and len(ct_up) >= 4 and ct_up[3:].isdigit()
+            is_carry = 'CARRY' in ct_up
+            is_mux = 'MUXF' in ct_up or ct_up in ('MUXCY', 'XORCY')
+            return (is_ff, is_lut or is_carry or is_mux)
+
+        n_ff_cells = sum(1 for _, (ct, _) in cell_info.items() if _ctype(ct)[0])
+        n_combo_cells = sum(1 for _, (ct, _) in cell_info.items() if _ctype(ct)[1])
+        top_types = sorted(cell_type_counts.items(), key=lambda x: -x[1])[:10]
+        INFO(f"  [path_timing] {len(cell_info)} cell name keys "
+             f"({n_ff_cells} FF, {n_combo_cells} combo), "
+             f"top types: {top_types}")
+
+        # Step 2b: Build cell connectivity from PHYSICAL BEL pin -> net
+        # For each cell, iterate its BEL pins.  Output pins tell us which
+        # nets the cell drives.  Data input pins tell us which nets the
+        # cell receives.  This bypasses EDIF entirely.
+        #
+        # We use: si.getNetFromSiteWire(belPin.getSiteWireName())
+        # to find the net connected to a BEL pin.
+
+        cell_out_nets: Dict[str, List[str]] = {}
+        net_in_cells: Dict[str, List[tuple]] = {}
+        n_checked = 0
+        n_has_out = 0
+
+        for cell in design.getCells():
+            phys_name = str(cell.getName())
+            ctype = str(cell.getType())
+            is_ff, is_combo = _ctype(ctype)
+            if not (is_ff or is_combo):
                 continue
-            sname = str(si.getName())
+            n_checked += 1
+            si = cell.getSiteInst()
+            if si is None: continue
             bel = cell.getBEL()
-            if bel is None:
-                continue
-            bel_name = str(bel.getName())
-            bel_id = f"{sname}/{bel_name}"
+            if bel is None: continue
 
-            # Classify by BEL name
-            is_ff = ('FF' in bel_name) or ('REG' in bel_name)
-            is_lut = 'LUT' in bel_name
-            is_carry = 'CARRY' in bel_name
-            is_mux = 'MUX' in bel_name
-            is_combo = is_lut or is_carry or is_mux
-
-            if is_ff:
-                is_ff_bel[bel_id] = True
-            if is_combo:
-                is_combo_bel[bel_id] = True
-            bel_to_site[bel_id] = sname
-
-        n_ff = sum(is_ff_bel.values())
-        n_combo = sum(is_combo_bel.values())
-        INFO(f"  [path_timing] {n_ff} FF-BELs, {n_combo} combo-BELs, "
-             f"{len(bel_to_site)} total BELs, {_time.time()-_t0:.1f}s")
-
-        # ------------------------------------------------------------------
-        # 3. Build BEL-level connectivity from physical net → pin → BEL
-        # ------------------------------------------------------------------
-        # We assign each net pin to a BEL identifier, avoiding Cell objects.
-        # Direction (output vs input) determines whether the BEL drives the
-        # net or receives it. Within a SLICE, internal routing may connect
-        # BEL-to-BEL without going through a global net — we only capture
-        # connections that go through the routing fabric (have a SitePin).
-
-        bel_out_nets: Dict[str, List[str]] = {}   # bel_id -> [net_name, ...]
-        net_in_bels: Dict[str, List[str]] = {}     # net_name -> [bel_id, ...]
-
-        n_pins_total = 0
-        n_pins_matched = 0
-        n_pins_unmatched = 0
-        n_out_edges = 0
-        n_in_edges = 0
-
-        n_no_siteinst = 0
-        n_no_belpin = 0
-        n_isoutput_fail = 0
-        n_no_bel = 0
-        n_input_filtered = 0
-
-        sample_failures: List[str] = []
-
-        for net in design.getNets():
-            net_name = str(net.getName())
-            if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
-                continue
-
-            for pin in net.getPins():
-                n_pins_total += 1
-
-                si = pin.getSiteInst()
-                if si is None:
-                    n_no_siteinst += 1
-                    n_pins_unmatched += 1
-                    continue
-
-                bel_pin = pin.getBELPin()
-                if bel_pin is None:
-                    n_no_belpin += 1
-                    n_pins_unmatched += 1
-                    continue
-
+            for bel_pin in bel.getPins():
                 try:
-                    is_output = bool(pin.isOutPin())
-                except Exception:
-                    n_isoutput_fail += 1
-                    n_pins_unmatched += 1
+                    sw = str(bel_pin.getSiteWireName())
+                except:
+                    continue
+                if not sw:
+                    continue
+                try:
+                    net = si.getNetFromSiteWire(sw)
+                except:
+                    continue
+                if net is None: continue
+                net_name = str(net.getName())
+                if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
+                    continue
+                try:
+                    is_out = bool(bel_pin.isOutput())
+                except:
                     continue
 
-                bel = bel_pin.getBEL()
-                if bel is None:
-                    n_no_bel += 1
-                    n_pins_unmatched += 1
-                    continue
-
-                sname = str(si.getName())
-                bel_name = str(bel.getName())
-                bel_id = f"{sname}/{bel_name}"
-                bel_pin_name = str(bel_pin.getName())
-                n_pins_matched += 1
-
-                if is_output:
-                    bel_out_nets.setdefault(bel_id, []).append(net_name)
-                    n_out_edges += 1
-                    if n_out_edges <= 10:
-                        INFO(f"  [path_timing]   output pin: bel={bel_id} pin={bel_pin_name} net={net_name}")
+                if is_out:
+                    cell_out_nets.setdefault(phys_name, []).append(net_name)
+                    n_has_out += 1
                 else:
-                    # Only trace data input pins (skip CLK, CE, SR, etc.)
-                    if bel_pin_name in ('D',) or \
-                       bel_pin_name.startswith('DI') or \
-                       (bel_pin_name.startswith('I') and len(bel_pin_name) <= 4):
-                        net_in_bels.setdefault(net_name, []).append(bel_id)
-                        n_in_edges += 1
-                        if n_in_edges <= 10:
-                            INFO(f"  [path_timing]   input pin: bel={bel_id} pin={bel_pin_name} net={net_name}")
-                    else:
-                        n_input_filtered += 1
-                        if n_input_filtered <= 20:
-                            INFO(f"  [path_timing]   filtered input: bel={bel_id} pin={bel_pin_name}")
+                    # Skip control pins (CLK, CE, SR, etc.)
+                    try:
+                        if bool(bel_pin.isClock()) or bool(bel_pin.isEnable()) \
+                           or bool(bel_pin.isReset()) or bool(bel_pin.isSet()):
+                            continue
+                    except:
+                        pass
+                    net_in_cells.setdefault(net_name, []).append(
+                        (phys_name, is_ff, is_combo))
 
-        INFO(f"  [path_timing] net pins: {n_pins_total} total, "
-             f"{n_pins_matched} matched, {n_pins_unmatched} unmatched, "
-             f"out_edges={n_out_edges}, in_edges={n_in_edges}")
-        INFO(f"  [path_timing]   fail reasons: noSiteInst={n_no_siteinst} "
-             f"noBELPin={n_no_belpin} isOutPinFail={n_isoutput_fail} "
-             f"noBEL={n_no_bel} inputFiltered={n_input_filtered}")
-        INFO(f"  [path_timing] connectivity: {len(bel_out_nets)} driving BELs, "
-             f"{len(net_in_bels)} driven nets, {_time.time()-_t0:.1f}s")
-
-        # Sample a few FF BELs and show their connectivity
-        _ff_sample_count = 0
-        for bel_id in list(is_ff_bel.keys()):
-            if _ff_sample_count >= 3:
-                break
-            out_nets = bel_out_nets.get(bel_id, [])
-            in_nets = [n for n, bs in net_in_bels.items() if bel_id in bs]
-            site = bel_to_site.get(bel_id, '?')
-            INFO(f"  [path_timing] FF-BEL sample: {bel_id} @ {site}, "
-                 f"out_nets={out_nets[:3]}, in_nets={in_nets[:3]}")
-            _ff_sample_count += 1
+        ff_src_count = sum(1 for c in cell_out_nets
+                           if _ctype(cell_info.get(c, ('', ''))[0])[0])
+        unique_ff_sinks = set()
+        for _, sinks in net_in_cells.items():
+            for (snk, is_ff, _) in sinks:
+                if is_ff: unique_ff_sinks.add(snk)
+        INFO(f"  [path_timing] physical cells: {n_checked} classified, "
+             f"{len(cell_out_nets)} drive nets ({ff_src_count} FF src), "
+             f"{len(net_in_cells)} driven nets, "
+             f"{len(unique_ff_sinks)} unique FF sinks")
 
         # ------------------------------------------------------------------
-        # 4. Trace FF-to-FF paths at the *BEL* level
+        # 3. Build DAG: fanin & fanout maps from physical connectivity
         # ------------------------------------------------------------------
-        # A path is a list of (bel_id, site_name, role) tuples.
-        # Node IDs are BEL identifiers like "SLICE_X106Y160/FF2".
+        # fanin[snk_cell]  = [driver_cell, ...]  — all cells feeding snk_cell
+        # fanout[src_cell] = [snk_cell, ...]     — all cells src_cell drives
+        fanin: Dict[str, List[str]] = {}
+        fanout: Dict[str, List[str]] = {}
+        for src_cell, net_list in cell_out_nets.items():
+            for net_name in net_list:
+                for (snk_cell, _, _) in net_in_cells.get(net_name, []):
+                    fanin.setdefault(snk_cell, []).append(src_cell)
+                    fanout.setdefault(src_cell, []).append(snk_cell)
 
-        BelPathEntry = Tuple[str, str, str]  # (bel_id, site_name, role)
-        all_paths: List[List[BelPathEntry]] = []
-        visited_bels: set = set()
-
-        ff_with_out = sum(1 for b in is_ff_bel if b in bel_out_nets and bel_out_nets[b])
-        ff_without_out = sum(1 for b in is_ff_bel if b not in bel_out_nets or not bel_out_nets[b])
-        combo_with_out = sum(1 for b in is_combo_bel if b in bel_out_nets and bel_out_nets[b])
-        combo_without_out = sum(1 for b in is_combo_bel if b not in bel_out_nets or not bel_out_nets[b])
-        nets_driving_bels = sum(1 for n, bs in net_in_bels.items() if bs)
-        INFO(f"  [path_timing] FF-BELs with/without output nets: {ff_with_out}/{ff_without_out}")
-        INFO(f"  [path_timing] Combo-BELs with/without output nets: {combo_with_out}/{combo_without_out}")
-        INFO(f"  [path_timing] Nets that drive at least one BEL: {nets_driving_bels}")
-
-        def _trace_from_ff(bel_id: str, max_depth: int = 30):
-            if bel_id in visited_bels:
-                return
-            visited_bels.add(bel_id)
-            site = bel_to_site.get(bel_id, '')
-
-            out_nets = bel_out_nets.get(bel_id, [])
-            for net_name in out_nets:
-                driven_bels = net_in_bels.get(net_name, [])
-                for db in driven_bels:
-                    if db in visited_bels:
-                        continue
-                    if is_ff_bel.get(db, False):
-                        all_paths.append([
-                            (bel_id, site, 'src_ff'),
-                            (db, bel_to_site.get(db, ''), 'sink_ff'),
-                        ])
-                    elif is_combo_bel.get(db, False):
-                        _trace_combo_chain(db, [
-                            (bel_id, site, 'src_ff'),
-                        ], depth=1, max_depth=max_depth)
-
-        def _trace_combo_chain(bel_id: str, path_so_far: List[BelPathEntry],
-                                depth: int, max_depth: int):
-            if depth > max_depth:
-                return
-            visited_bels.add(bel_id)
-            site = bel_to_site.get(bel_id, '')
-            out_nets = bel_out_nets.get(bel_id, [])
-            for net_name in out_nets:
-                driven_bels = net_in_bels.get(net_name, [])
-                for db in driven_bels:
-                    if db in visited_bels:
-                        continue
-                    if is_ff_bel.get(db, False):
-                        all_paths.append(path_so_far + [
-                            (bel_id, site, 'combo'),
-                            (db, bel_to_site.get(db, ''), 'sink_ff'),
-                        ])
-                    elif is_combo_bel.get(db, False):
-                        _trace_combo_chain(
-                            db, path_so_far + [(bel_id, site, 'combo')],
-                            depth + 1, max_depth)
-
-        ff_bels = [b for b, v in is_ff_bel.items() if v]
-        INFO(f"  [path_timing] tracing from {len(ff_bels)} source FF-BELs...")
-
-        ff_budget = min(len(ff_bels), 2000)
-        for fb in ff_bels[:ff_budget]:
-            _trace_from_ff(fb)
-
-        INFO(f"  [path_timing] found {len(all_paths)} FF-to-FF paths, "
-             f"{_time.time()-_t0:.1f}s")
-
-        if len(all_paths) > max_paths:
-            all_paths = all_paths[:max_paths]
+        # Identify FF sources and FF sinks
+        all_ff_cells = {c for c, (ct, _) in cell_info.items() if _ctype(ct)[0]}
+        ff_sources = {c for c in all_ff_cells if c in fanout}
+        ff_sinks   = {c for c in all_ff_cells if c in fanin}
+        combo_cells = {c for c, (ct, _) in cell_info.items()
+                       if not _ctype(ct)[0] and (c in fanout or c in fanin)}
 
         # ------------------------------------------------------------------
-        # 5. Compute delays for each path
+        # 4. Topological sort (Kahn's algorithm) on combinational cells
         # ------------------------------------------------------------------
-        # We use a per-site average combo delay since BEL-level cell types
-        # are already classified by BEL name.
+        # in_degree counts only incoming edges *from other combos*
+        in_degree: Dict[str, int] = {}
+        for c in combo_cells:
+            in_degree[c] = sum(1 for d in fanin.get(c, []) if d in combo_cells)
 
-        def _bel_type_to_delay(bel_name: str) -> float:
-            if 'LUT' in bel_name:
+        from collections import deque
+        queue = deque(c for c in combo_cells if in_degree.get(c, 0) == 0)
+        sorted_combos: List[str] = []
+
+        while queue:
+            node = queue.popleft()
+            sorted_combos.append(node)
+            for snk in fanout.get(node, []):
+                if snk in combo_cells:
+                    in_degree[snk] -= 1
+                    if in_degree[snk] == 0:
+                        queue.append(snk)
+
+        # Cycle detection: if some combos were never sorted, break the loop
+        if len(sorted_combos) != len(combo_cells):
+            cyclic = set(combo_cells) - set(sorted_combos)
+            WARNING(f"  [path_timing] cycle detected in {len(cyclic)} combos, "
+                    f"appending unsorted at end")
+            sorted_combos.extend(cyclic)
+
+        # ------------------------------------------------------------------
+        # 5. Cell-type-to-delay helper (same logic as before)
+        # ------------------------------------------------------------------
+        def _cell_type_to_delay(ctype: str) -> float:
+            ct = ctype.upper()
+            if ct.startswith('LUT') and ct[3:].isdigit():
                 return self.cell_delays.get('LUT', {}).get('max', 100e-12)
-            if 'CARRY' in bel_name:
+            if 'CARRY' in ct:
                 return self.cell_delays.get('CARRY', {}).get('max', 80e-12)
-            if 'MUX' in bel_name:
+            if 'MUX' in ct:
                 return self.cell_delays.get('MUX', {}).get('max', 90e-12)
-            if 'DSP' in bel_name:
+            if 'DSP' in ct:
                 return self.cell_delays.get('DSP', {}).get('max', 500e-12)
-            if 'RAMB' in bel_name or 'BRAM' in bel_name:
+            if 'RAMB' in ct or 'BRAM' in ct:
                 return self.cell_delays.get('BRAM', {}).get('max', 600e-12)
             return 60e-12
 
-        path_delays: List[float] = []
-        path_descriptions: List[str] = []
-
-        for path in all_paths:
-            total_cell_delay = 0.0
-            total_wire_delay = 0.0
-
-            for i, (bel_id, site_name, role) in enumerate(path):
-                if role == 'sink_ff':
-                    continue
-
-                if role == 'src_ff':
-                    total_cell_delay += self.ff_clk2q_time
-                else:
-                    # Extract BEL name from bel_id (format: "site/belname")
-                    bel_short = bel_id.split('/')[-1] if '/' in bel_id else ''
-                    total_cell_delay += _bel_type_to_delay(bel_short)
-
-                # Wire delay to next site
-                if i + 1 < len(path):
-                    next_site = path[i + 1][1]
-                    if site_name in site_to_coord and next_site in site_to_coord:
-                        x1, y1 = site_to_coord[site_name]
-                        x2, y2 = site_to_coord[next_site]
-                        dist = abs(x1 - x2) + abs(y1 - y2)
-                        total_wire_delay += dist * self.wire_delay_per_site
-
-            total_cell_delay += self.ff_setup_time
-
-            total_delay = total_cell_delay + total_wire_delay
-            path_delays.append(total_delay)
-
-            desc = f"{path[0][0]} -> ... -> {path[-1][0]}"
-            path_descriptions.append(desc)
+        def _wire_delay_between(a: str, b: str) -> float:
+            _, site_a = cell_info.get(a, ('', ''))
+            _, site_b = cell_info.get(b, ('', ''))
+            if site_a in site_to_coord and site_b in site_to_coord:
+                x1, y1 = site_to_coord[site_a]
+                x2, y2 = site_to_coord[site_b]
+                return (abs(x1 - x2) + abs(y1 - y2)) * self.wire_delay_per_site
+            return 0.0
 
         # ------------------------------------------------------------------
-        # 6. Compute timing metrics
+        # 6. Propagate Arrival Times (AT) through the DAG
         # ------------------------------------------------------------------
-        if not path_delays:
-            INFO("  [path_timing] No FF-to-FF paths found — falling back to heuristic.")
-            return self.analyze_framework(
-                placer.net_manager, logic_coords, io_coords, include_io, clock_period
-            )
+        AT: Dict[str, float] = {}
 
-        critical_path_delay = max(path_delays)
-        wns = self.clock_period - critical_path_delay
+        # Initialize source FF outputs to clock-to-Q delay
+        for ff in ff_sources:
+            AT[ff] = self.ff_clk2q_time
 
+        # Initialize remaining cells to 0 (combo cells without AT yet)
+        for c in combo_cells:
+            AT.setdefault(c, 0.0)
+
+        # Track logic depth (max combos on any path) via topological propagation
+        depth: Dict[str, int] = {}
+        for ff in ff_sources:
+            depth[ff] = 0
+
+        # Process combos in topological order
+        for combo in sorted_combos:
+            max_arrival = 0.0
+            max_depth = 0
+            for driver in fanin.get(combo, []):
+                driver_at = AT.get(driver, 0.0)
+                arrival = driver_at + _wire_delay_between(driver, combo)
+                max_arrival = max(max_arrival, arrival)
+                max_depth = max(max_depth, depth.get(driver, 0))
+            ctype, _ = cell_info.get(combo, ('', ''))
+            AT[combo] = max_arrival + _cell_type_to_delay(ctype)
+            depth[combo] = max_depth + 1
+
+        # ------------------------------------------------------------------
+        # 7. Compute arrival times at FF sink inputs, then slack
+        # ------------------------------------------------------------------
+        required_time = self.clock_period - self.ff_setup_time
+
+        critical_path_delay = 0.0
+        wns = float('inf')
         tns = 0.0
         num_violations = 0
-        for pd in path_delays:
-            slack = self.clock_period - pd
+        endpoint_slacks: List[Tuple[str, float]] = []
+        logic_levels = 0
+
+        # Track worst path info for the critical path description
+        worst_ff_sink = ''
+        worst_at = 0.0
+
+        for ff in ff_sinks:
+            max_arrival_at_d = 0.0
+            longest_driver = ''
+            for driver in fanin.get(ff, []):
+                driver_at = AT.get(driver, 0.0)
+                arrival = driver_at + _wire_delay_between(driver, ff)
+                if arrival > max_arrival_at_d:
+                    max_arrival_at_d = arrival
+                    longest_driver = driver
+            if max_arrival_at_d == 0.0:
+                continue  # no data path to this FF
+
+            slack = required_time - max_arrival_at_d
+            endpoint_slacks.append((ff, slack))
+            if slack < wns:
+                wns = slack
+                worst_ff_sink = ff
+                worst_at = max_arrival_at_d
+
             if slack < 0:
                 tns += slack
                 num_violations += 1
 
+            if max_arrival_at_d > critical_path_delay:
+                critical_path_delay = max_arrival_at_d
+
+            # Logic depth = max combo depth feeding this FF sink
+            for driver in fanin.get(ff, []):
+                logic_levels = max(logic_levels, depth.get(driver, 0))
+
+        # Also check FF->FF direct connections (no combos in between)
+        for ff_src in ff_sources:
+            for snk in fanout.get(ff_src, []):
+                if snk in ff_sinks:
+                    wire_d = _wire_delay_between(ff_src, snk)
+                    at_d = AT.get(ff_src, self.ff_clk2q_time) + wire_d
+                    slack = required_time - at_d
+                    endpoint_slacks.append((snk, slack))
+                    if slack < wns:
+                        wns = slack
+                        worst_ff_sink = snk
+                        worst_at = at_d
+                    if slack < 0:
+                        tns += slack
+                        num_violations += 1
+                    if at_d > critical_path_delay:
+                        critical_path_delay = at_d
+                    logic_levels = max(logic_levels, 1)
+
+        # ------------------------------------------------------------------
+        # 8. Compute final metrics
+        # ------------------------------------------------------------------
+        if not ff_sinks and not ff_sources:
+            INFO("  [path_timing] No FF sinks/sources found — falling back to heuristic.")
+            return self.analyze_framework(
+                placer.net_manager, logic_coords, io_coords, include_io, clock_period
+            )
+
         estimated_period = critical_path_delay
         fmax = 1.0 / estimated_period if estimated_period > 0 else 0.0
 
-        logic_levels = max((len(p) - 1) for p in all_paths) if all_paths else 0
+        # Sort slacks ascending (most negative first) for violated list
+        endpoint_slacks.sort(key=lambda x: x[1])
+        num_endpoints = len(endpoint_slacks)
 
-        violated = [(desc, self.clock_period - pd)
-                    for desc, pd in zip(path_descriptions, path_delays)
-                    if (self.clock_period - pd) < 0]
-        violated.sort(key=lambda x: x[1])
-
+        INFO(f"  [path_timing] DAG: {len(combo_cells)} combos, "
+             f"{len(ff_sources)} FF src, {len(ff_sinks)} FF snk, "
+             f"{len(sorted_combos)} topo-sorted, "
+             f"{_time.time()-_t0:.1f}s")
         INFO(f"  [path_timing] critical path: {critical_path_delay*1e9:.3f} ns, "
              f"WNS={wns*1e9:.3f} ns, Fmax={fmax/1e6:.1f} MHz, "
+             f"endpoints={num_endpoints}, "
              f"took {_time.time()-_t0:.1f}s")
 
         return TimingSummary(
@@ -738,10 +734,10 @@ class TimingAnalyzer:
             estimated_period=estimated_period,
             critical_path_delay=critical_path_delay,
             logic_depth=logic_levels,
-            num_paths=len(path_delays),
+            num_paths=num_endpoints,
             num_violations=num_violations,
             wire_delays={},
-            top_violated_nets=violated[:20],
+            top_violated_nets=endpoint_slacks[:20],
         )
 
     def ff_overhead_per_stage(self) -> float:
@@ -1033,7 +1029,7 @@ def analyze_placement_timing(
     clock_period_ns: float = 5.0,
     mode: str = 'heuristic',
     design: Optional[Any] = None,
-    max_paths: int = 10000,
+    max_paths: int = 0,
 ) -> TimingSummary:
     """
     Convenience function to analyze timing for a placement result.
@@ -1047,7 +1043,7 @@ def analyze_placement_timing(
         mode: ``'heuristic'`` (HPWL-based estimate) or ``'path'`` (actual
             FF-to-FF path tracing; requires ``design``).
         design: RapidWright Design object (required for ``mode='path'``).
-        max_paths: Max paths to trace for ``mode='path'``.
+        max_paths: Max paths to trace (0 = unlimited).
 
     Returns:
         TimingSummary with estimated timing metrics.
@@ -1095,7 +1091,7 @@ def analyze_path_based_timing(
     io_coords: Optional[torch.Tensor] = None,
     include_io: bool = False,
     clock_period_ns: float = 5.0,
-    max_paths: int = 10000,
+    max_paths: int = 0,
 ) -> TimingSummary:
     """
     Convenience function for path-based (FF-to-FF) timing analysis.
@@ -1107,7 +1103,7 @@ def analyze_path_based_timing(
         io_coords: Placed IO coordinates [M, 2] (optional).
         include_io: Whether to include IO in analysis.
         clock_period_ns: Target clock period in nanoseconds.
-        max_paths: Maximum number of paths to trace.
+        max_paths: Maximum paths to trace (0 = unlimited).
 
     Returns:
         TimingSummary with actual path-based timing metrics.

@@ -20,7 +20,7 @@ class PlacementDrawer:
         self.placer = placer
 
         self.logic_grid: Grid = placer.get_grid('logic')
-        self.io_grid: Grid  = placer.get_grid('io')
+        self.io_grid: Grid | None = placer.get_grid('io') if 'io' in placer.grids else None
         self._calculate_overall_bbox(False)
         self.debug_mode = debug_mode
 

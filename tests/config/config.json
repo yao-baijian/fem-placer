@@ -1,13 +1,10 @@
 {
     "_comment": "Default test configuration. Copy to tests/config/config.json and edit.",
     "instances": [
-        "FPGA-example1"
+        "s15850"
     ],
     "regions": [
-        "logic",
-        "io",
-        "clock",
-        "dsp"
+        "logic"
     ],
     "verbose": false,
     "grid_type": "SQUARE",
