@@ -7,6 +7,43 @@ from fem_placer import Legalizer, FPGAPlacementOptimizer
 from fem_placer.config import PlaceType
 
 
+def _build_optimizer_dicts(fpga_placer, alpha, beta, io_factor, place_type):
+    """Build N-region dicts for the optimizer from legacy scalar alpha/beta/io_factor."""
+    regions = [r for r in fpga_placer.regions if fpga_placer.instances[r].num > 0]
+    region_sizes = {r: (fpga_placer.instances[r].num, max(fpga_placer.get_grid(r).area, 1)) for r in regions}
+    region_site_coords = {}
+    for r in regions:
+        attr = f'{r}_site_coords'
+        if hasattr(fpga_placer, attr):
+            region_site_coords[r] = getattr(fpga_placer, attr)
+        else:
+            g = fpga_placer.get_grid(r)
+            region_site_coords[r] = g.to_real_coords_tensor(torch.cartesian_prod(
+                torch.arange(g.area_length, dtype=torch.float32, device=fpga_placer.device),
+                torch.arange(g.area_width, dtype=torch.float32, device=fpga_placer.device)
+            ))
+    io_mat = fpga_placer.net_manager.io_insts_matrix
+    region_coupling = {}
+    for rA in regions:
+        region_coupling[rA] = {}
+        for rB in regions:
+            if rA == rB == 'logic':
+                region_coupling[rA][rB] = fpga_placer.net_manager.insts_matrix
+            elif rA == 'logic' and rB == 'io' and io_mat is not None:
+                region_coupling[rA][rB] = io_mat
+            elif rA == 'io' and rB == 'logic' and io_mat is not None:
+                region_coupling[rA][rB] = io_mat.T.clone()
+            else:
+                region_coupling[rA][rB] = None
+
+    # constraint_coeffs and h_factors as lists positionally mapped to regions
+    coeff_map = {'logic': alpha, 'io': beta}
+    constraint_coeffs = [coeff_map.get(r, 1.0) for r in regions]
+    h_factors = [io_factor * 0.01 if r == 'io' else 0.01 for r in regions]
+
+    return regions, region_sizes, region_coupling, region_site_coords, constraint_coeffs, h_factors
+
+
 def run_logic_placement(
     fpga_placer,
     alpha: float,
@@ -21,33 +58,29 @@ def run_logic_placement(
 ) -> Dict[str, Any]:
     """Run a single logic placement optimization + legalization.
 
-    This centralizes the common optimizer/legalizer flow used by
-    test_train_alpha.py and test_ml_prediction_comparison.py.
+    Uses the new N-region optimizer API internally. Legacy scalar
+    alpha/beta params are mapped to per-region ``constraint_coeffs`` lists.
 
     Returns a dict with placement, overlap, HPWL dictionaries, and runtime.
     """
     # Clear grid state before each run
-    fpga_placer.grids["logic"].clear_all()
-    if place_type == PlaceType.IO:
-        fpga_placer.grids["io"].clear_all()
+    for r in fpga_placer.regions:
+        fpga_placer.grids[r].clear_all()
 
     fpga_placer.set_alpha(alpha)
     if place_type == PlaceType.IO:
         fpga_placer.set_beta(beta)
 
+    regions, region_sizes, region_coupling, region_site_coords, constraint_coeffs, h_factors = \
+        _build_optimizer_dicts(fpga_placer, alpha, beta, io_factor, place_type)
+
     optimizer = FPGAPlacementOptimizer(
-        num_inst=fpga_placer.instances["logic"].num,
-        num_fixed_inst=fpga_placer.instances["io"].num,
-        num_site=fpga_placer.get_grid("logic").area,
-        num_fixed_site=fpga_placer.get_grid("io").area,
-        coupling_matrix=fpga_placer.net_manager.insts_matrix,
-        site_coords_matrix=fpga_placer.logic_site_coords,
-        io_site_connect_matrix=fpga_placer.net_manager.io_insts_matrix,
-        io_site_coords=fpga_placer.io_site_coords,
-        constraint_alpha=fpga_placer.constraint_alpha,
-        # For IO placements, beta can be set separately via fpga_placer,
-        # but for logic-only CENTERED placement we mirror existing usage.
-        constraint_beta=fpga_placer.constraint_alpha,
+        regions=regions,
+        region_sizes=region_sizes,
+        region_coupling=region_coupling,
+        region_site_coords=region_site_coords,
+        constraint_coeffs=constraint_coeffs,
+        h_factors=h_factors,
         num_trials=num_trials,
         num_steps=num_steps,
         dev=dev,
@@ -56,31 +89,25 @@ def run_logic_placement(
         anneal=anneal,
         optimizer="adam",
         learning_rate=0.1,
-        h_factor=0.01,
-        io_factor=io_factor,
         seed=1,
         dtype=torch.float32,
-        with_io=(place_type == PlaceType.IO),
         manual_grad=manual_grad,
+        distance_metric='manhattan',
     )
 
     t0 = time.time()
     config, result = optimizer.optimize()
     optimal_inds = torch.argwhere(result == result.min()).reshape(-1)
     legalizer = Legalizer(placer=fpga_placer, device=dev)
-    logic_ids, io_ids = fpga_placer.get_ids()
+    all_ids = fpga_placer.get_ids()
+    region_id_map = dict(zip(fpga_placer.regions, all_ids))
 
-    if place_type == PlaceType.IO:
-        real_logic_coords = config[0][optimal_inds[0]]
-        real_io_coords = config[1][optimal_inds[0]]
-        placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(
-            real_logic_coords, logic_ids, real_io_coords, io_ids, include_io=True
-        )
-    else:
-        real_logic_coords = config[optimal_inds[0]]
-        placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(
-            real_logic_coords, logic_ids
-        )
+    best_config = {r: config[r][optimal_inds[0]] for r in config}
+    best_ids = {r: region_id_map[r] for r in config if r in region_id_map}
+
+    placement_legalized, overlap, fem_hpwl_initial, fem_hpwl_final = legalizer.legalize_placement(
+        best_config, best_ids
+    )
 
     t1 = time.time()
 
