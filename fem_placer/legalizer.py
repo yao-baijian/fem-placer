@@ -11,94 +11,113 @@ class Legalizer:
     def __init__(self,
                  placer,
                  device,
-                 overlap_solver: str = 'greedy', # greedy, hungarian, 
+                 overlap_solver: str = 'greedy',
                  hungarian_distance_weight: float = 0.1,
                  hungarian_max_empty_sites: Optional[int] = None,
                  enable_importance_based_swapping: bool = False,
                  fast_first_improvement: bool = True):
         self.placer: FpgaPlacer = placer
-        self.logic_grid: Grid = self.placer.get_grid('logic')
-        self.io_grid: Grid = self.placer.get_grid('io')
-
         self.device = device
 
-        self.logic_instance_ids = set()
-        self.io_instance_ids = set()
+        # Build grids from whatever regions the placer has
+        self.grids: Dict[str, Grid] = {}
+        for r in placer.regions:
+            try:
+                self.grids[r] = placer.get_grid(r)
+            except Exception:
+                WARNING(f"Legalizer: no grid for region '{r}', skipping")
+
         self.overlap_solver = overlap_solver
         self.hungarian_distance_weight = hungarian_distance_weight
         self.hungarian_max_empty_sites = hungarian_max_empty_sites
         self.enable_importance_based_swapping = enable_importance_based_swapping
         self.fast_first_improvement = fast_first_improvement
 
-    def legalize_placement(self, coords, ids, io_coords=None, io_ids=None, include_io=False):
+    def legalize_placement(self, region_coords: Dict[str, torch.Tensor],
+                           region_ids: Dict[str, torch.Tensor]):
+        """
+        Legalize placements for all regions.
+
+        Args:
+            region_coords: ``{region_name: coords_tensor [N, 2]}``
+            region_ids: ``{region_name: ids_tensor [N]}``
+
+        Returns:
+            ``(legalized_coords, total_overlap, hpwl_before, hpwl_after)``
+            where ``legalized_coords`` is a dict ``{region_name: tensor [N, 2]}``.
+        """
+        regions = [r for r in region_coords if r in self.grids and r in region_ids]
+
         INFO(f"Stage 1: solve overlap")
-        self._load_coords_to_grids(self.logic_grid, coords, ids)
-        logic_moved = self._resolve_grid_overlaps(self.logic_grid, coords, io_coords, False)
-        io_moved = 0
-        if include_io:
-            self._load_coords_to_grids(self.io_grid, io_coords, io_ids)
-            io_moved = self._resolve_grid_overlaps(self.io_grid, coords, io_coords, True)
+        total_moved = 0
+        for r in regions:
+            self._load_coords_to_grids(self.grids[r], region_coords[r], region_ids[r])
+            moved = self._resolve_grid_overlaps(self.grids[r], region_coords)
+            total_moved += moved
 
-        legalized_logic = self.logic_grid.to_coords_tensor(coords.shape[0])
-        legalized_io = self.io_grid.to_coords_tensor(io_coords.shape[0]) if include_io else None
+        # Build legalized coords dict
+        legalized = {}
+        for r in regions:
+            n = region_coords[r].shape[0]
+            legalized[r] = self.grids[r].to_coords_tensor(n)
 
-        hpwl_before= self.placer.net_manager.analyze_solver_hpwl(coords, io_coords, include_io)
-        hpwl_legalized = self.placer.net_manager.analyze_solver_hpwl(legalized_logic, legalized_io, include_io)
-
-        if include_io:
-            INFO(f"Hpwl {hpwl_before['hpwl']:.2f} -> {hpwl_legalized['hpwl']:.2f}, logic move: {logic_moved}, io move: {io_moved}")
-        else:
-            INFO(f"Hpwl no IO {hpwl_before['hpwl_no_io']:.2f} -> {hpwl_legalized['hpwl_no_io']:.2f}, moved {logic_moved} instances")
+        # HPWL before / after
+        all_coords_before = [region_coords[r] for r in regions]
+        all_coords_after = [legalized[r] for r in regions]
+        hpwl_before = self.placer.net_manager.analyze_solver_hpwl(*all_coords_before)
+        hpwl_after  = self.placer.net_manager.analyze_solver_hpwl(*all_coords_after)
+        moved_str = ' + '.join(f"{r}: {m}" for r, m in zip(regions, [0]*len(regions)))
+        INFO(f"Hpwl {hpwl_before.get('hpwl', hpwl_before.get('hpwl_no_io', 0)):.2f} -> "
+             f"{hpwl_after.get('hpwl', hpwl_after.get('hpwl_no_io', 0)):.2f}, "
+             f"moved {total_moved} instances")
 
         INFO(f"Stage 2: global optimization")
+        optimized = self._global_optimization(legalized, region_ids, iteration=3)
+        all_coords_opt = [optimized[r] for r in regions]
+        hpwl_opt = self.placer.net_manager.analyze_solver_hpwl(*all_coords_opt)
+        hpwl_after_val = hpwl_after.get('hpwl', hpwl_after.get('hpwl_no_io', 0))
+        hpwl_opt_val = hpwl_opt.get('hpwl', hpwl_opt.get('hpwl_no_io', 0))
+        INFO(f"Optimized Hpwl {hpwl_opt_val:.2f}, improve {hpwl_opt_val - hpwl_after_val:.2f}")
 
-        optimized_logic, optimized_io = self._global_optimization(
-            legalized_logic, legalized_io, include_io, iteration=3
-        )
-        hpwl_opt = self.placer.net_manager.analyze_solver_hpwl(
-            optimized_logic, optimized_io, include_io
-        )
+        return optimized, total_moved, hpwl_before, hpwl_opt
 
-        if include_io:
-            INFO(f"Optimized Hpwl {hpwl_opt['hpwl']:.2f}, improve {hpwl_opt['hpwl'] - hpwl_legalized['hpwl']:.2f}")
-        else:
-            INFO(f"Optimized hpwl no IO {hpwl_opt['hpwl_no_io']:.2f}, improve {hpwl_opt['hpwl_no_io'] - hpwl_legalized['hpwl_no_io']:.2f}")
+    # ------------------------------------------------------------------
+    # Internal helpers — accept region_coords dict, extract logic/io for
+    # the net manager calls (which still use the legacy signature).
+    # ------------------------------------------------------------------
 
-        return [optimized_logic, optimized_io], logic_moved+io_moved, hpwl_legalized, hpwl_opt
+    def _logic_io_from(self, region_coords):
+        return (region_coords.get('logic'),
+                region_coords.get('io'),
+                'io' in region_coords)
 
     def _load_coords_to_grids(self, grid: Grid, coords: torch.Tensor, ids: torch.Tensor):
         grid.clear_all()
         grid.from_coords_tensor(coords, ids)
         INFO(f"Loaded {len(ids)} instance to grid")
 
-    def _resolve_grid_overlaps(self, grid: Grid, logic_coords: torch.Tensor,
-                              io_coords: Optional[torch.Tensor], include_io: bool) -> int:
+    def _resolve_grid_overlaps(self, grid: Grid, region_coords: Dict[str, torch.Tensor]) -> int:
+        lc, ioc, inc_io = self._logic_io_from(region_coords)
+
         if self.overlap_solver == 'hungarian':
-            return self._resolve_grid_overlaps_hungarian(
-                grid, logic_coords, io_coords, include_io
-            )
+            return self._resolve_grid_overlaps_hungarian(grid, lc, ioc, inc_io)
 
         moved_count = 0
-
         conflict_groups = self._collect_conflict_groups(grid)
         sorted_conflicts = sorted(conflict_groups.items(), key=lambda x: len(x[1]), reverse=True)
 
         for conflict_pos, conflict_instances in sorted_conflicts:
             if len(conflict_instances) <= 1:
                 continue
-
             success, num_moved = self._resolve_conflict_in_grid(
-                grid, conflict_pos, conflict_instances, logic_coords, io_coords, include_io
+                grid, conflict_pos, conflict_instances, lc, ioc, inc_io
             )
-
             if success:
                 moved_count += num_moved
 
         remaining_conflicts = self._check_remaining_overlaps(grid)
-
         if remaining_conflicts > 0:
             WARNING(f'{remaining_conflicts} conflicts are not resolved')
-
         return moved_count
 
     def _collect_conflict_groups(self, grid: Grid) -> Dict[Tuple[int, int], List[int]]:
@@ -111,233 +130,140 @@ class Legalizer:
                 conflict_groups[pos_tuple] = [instance_id]
         return {pos: insts for pos, insts in conflict_groups.items() if len(insts) > 1}
 
-    def _resolve_grid_overlaps_hungarian(self,
-                                         grid: Grid,
-                                         logic_coords: torch.Tensor,
-                                         io_coords: Optional[torch.Tensor],
-                                         include_io: bool) -> int:
+    def _resolve_grid_overlaps_hungarian(self, grid, logic_coords, io_coords, include_io):
         conflict_groups = self._collect_conflict_groups(grid)
         if not conflict_groups:
             return 0
-
-        conflict_instances: List[int] = []
+        conflict_instances = []
         for instances in conflict_groups.values():
             if len(instances) > 1:
                 conflict_instances.extend(instances[1:])
-
         if not conflict_instances:
             return 0
-
-        empty_positions: List[Tuple[int, int]] = list(grid._empty_positions)
+        empty_positions = list(grid._empty_positions)
         if not empty_positions:
             ERROR(f"Grid '{grid.name}' has no empty place")
             return 0
-
-        if self.hungarian_max_empty_sites is not None and self.hungarian_max_empty_sites > 0 and len(empty_positions) > self.hungarian_max_empty_sites:
-            conflict_center_x = sum(pos[0] for pos in conflict_groups.keys()) / max(1, len(conflict_groups))
-            conflict_center_y = sum(pos[1] for pos in conflict_groups.keys()) / max(1, len(conflict_groups))
-            empty_positions = sorted(
-                empty_positions,
-                key=lambda pos: abs(pos[0] - conflict_center_x) + abs(pos[1] - conflict_center_y)
-            )[:self.hungarian_max_empty_sites]
-
+        if self.hungarian_max_empty_sites is not None and len(empty_positions) > self.hungarian_max_empty_sites:
+            cx = sum(pos[0] for pos in conflict_groups) / max(1, len(conflict_groups))
+            cy = sum(pos[1] for pos in conflict_groups) / max(1, len(conflict_groups))
+            empty_positions = sorted(empty_positions, key=lambda p: abs(p[0]-cx)+abs(p[1]-cy))[:self.hungarian_max_empty_sites]
         if len(empty_positions) < len(conflict_instances):
-            WARNING(
-                f"Grid '{grid.name}' empty sites ({len(empty_positions)}) are fewer than conflict instances ({len(conflict_instances)}), applying partial matching."
-            )
-
+            WARNING(f"Grid '{grid.name}' empty sites ({len(empty_positions)}) < conflict instances ({len(conflict_instances)})")
         candidate_xy = [(x, y) for x, y in empty_positions]
-        num_instances = len(conflict_instances)
-        num_candidates = len(candidate_xy)
-
-        if num_instances == 0 or num_candidates == 0:
+        n_inst, n_cand = len(conflict_instances), len(candidate_xy)
+        if n_inst == 0 or n_cand == 0:
             return 0
-
-        cost_matrix = np.zeros((num_instances, num_candidates), dtype=np.float32)
-
-        for i, instance_id in enumerate(conflict_instances):
-            current_pos = grid.get_instance_position(instance_id)
-            if current_pos is None:
+        cost_matrix = np.zeros((n_inst, n_cand), dtype=np.float32)
+        for i, inst_id in enumerate(conflict_instances):
+            cp = grid.get_instance_position(inst_id)
+            if cp is None:
                 cost_matrix[i, :] = 1e6
                 continue
-
-            current_hpwl = self.placer.net_manager.compute_instance_move_hpwl(
-                instance_id, logic_coords, io_coords, include_io
-            )
-
-            hpwl_candidates = self.placer.net_manager.compute_instance_move_hpwl_batch(
-                instance_id,
-                logic_coords,
-                io_coords,
-                include_io,
-                candidate_xy
-            )
-
-            distance_penalty = np.fromiter(
-                (
-                    (abs(candidate_x - current_pos[0]) + abs(candidate_y - current_pos[1])) * self.hungarian_distance_weight
-                    for candidate_x, candidate_y in candidate_xy
-                ),
-                dtype=np.float32,
-                count=num_candidates,
-            )
-
-            hpwl_delta = np.asarray(hpwl_candidates, dtype=np.float32) - float(current_hpwl)
-            cost_matrix[i, :] = hpwl_delta + distance_penalty
-
+            cur = self.placer.net_manager.compute_instance_move_hpwl(inst_id, logic_coords, io_coords, include_io)
+            cand = self.placer.net_manager.compute_instance_move_hpwl_batch(inst_id, logic_coords, io_coords, include_io, candidate_xy)
+            pen = np.array([abs(cx-cp[0])+abs(cy-cp[1]) for cx,cy in candidate_xy], dtype=np.float32) * self.hungarian_distance_weight
+            cost_matrix[i, :] = (np.asarray(cand, dtype=np.float32) - float(cur)) + pen
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        moved_count = 0
-
-        for row_idx, col_idx in zip(row_ind.tolist(), col_ind.tolist()):
-            instance_id = conflict_instances[row_idx]
-            target_x, target_y = candidate_xy[col_idx]
-            current_pos = grid.get_instance_position(instance_id)
-            if current_pos is None or (current_pos[0] == target_x and current_pos[1] == target_y):
+        moved = 0
+        for ri, ci in zip(row_ind, col_ind):
+            inst_id = conflict_instances[ri]
+            tx, ty = candidate_xy[ci]
+            cp = grid.get_instance_position(inst_id)
+            if cp is None or (cp[0]==tx and cp[1]==ty):
                 continue
-
-            success, _, _ = grid.move_instance(
-                instance_id,
-                target_x,
-                target_y,
-                swap_allowed=False,
-            )
-            if success:
-                moved_count += 1
-
-        remaining_conflicts = self._check_remaining_overlaps(grid)
-        if remaining_conflicts > 0:
-            WARNING(f'{remaining_conflicts} conflicts are not resolved after Hungarian stage')
-
-        return moved_count
+            ok, _, _ = grid.move_instance(inst_id, tx, ty, swap_allowed=False)
+            if ok:
+                moved += 1
+        rem = self._check_remaining_overlaps(grid)
+        if rem > 0:
+            WARNING(f'{rem} conflicts not resolved after Hungarian stage')
+        return moved
 
     def _check_remaining_overlaps(self, grid: Grid) -> int:
-        position_count = {}
+        pos_cnt = {}
         for _, pos in grid.instance_positions.items():
-            pos_tuple = tuple(pos)
-            position_count[pos_tuple] = position_count.get(pos_tuple, 0) + 1
+            t = tuple(pos)
+            pos_cnt[t] = pos_cnt.get(t, 0) + 1
+        rem = [(p, c) for p, c in pos_cnt.items() if c > 1]
+        if rem:
+            INFO(f" remain overlapped: {rem}")
+        return len(rem)
 
-        remaining = [(pos, count) for pos, count in position_count.items() if count > 1]
-
-        if remaining:
-            INFO(f" remain overlapped position: {remaining}")
-
-        return len(remaining)
-
-    def _resolve_conflict_in_grid(self, grid: Grid, conflict_pos, conflict_instances,
-                                 logic_coords: torch.Tensor, io_coords: Optional[torch.Tensor],
-                                 include_io: bool) -> Tuple[bool, int]:
-        conflict_x, conflict_y = conflict_pos
-        
-        needed_positions = len(conflict_instances) + 1
-        empty_positions = grid.find_empty_positions_nearby(conflict_x, conflict_y, needed_positions)
-
-        if len(empty_positions) < needed_positions - 1:
+    def _resolve_conflict_in_grid(self, grid, conflict_pos, conflict_instances,
+                                  logic_coords, io_coords, include_io):
+        cx, cy = conflict_pos
+        needed = len(conflict_instances) + 1
+        empty = grid.find_empty_positions_nearby(cx, cy, needed)
+        if len(empty) < needed - 1:
             ERROR(f"Grid '{grid.name}' has no empty place")
             return False, 0
-        
-        empty_positions.insert(0, (conflict_x, conflict_y, 0))
-        m = len(conflict_instances)
-        n = min(len(empty_positions), m + 3)
-        candidate_positions = empty_positions[:n]
-        candidate_xy = [(pos_x, pos_y) for pos_x, pos_y, _ in candidate_positions]
-        cost_matrix = torch.zeros((m, n), device=self.device)
-
-        for i, instance_id in enumerate(conflict_instances):
-            current_hpwl = self.placer.net_manager.compute_instance_move_hpwl(
-                instance_id, logic_coords, io_coords, include_io
-            )
-
-            hpwl_candidates = self.placer.net_manager.compute_instance_move_hpwl_batch(
-                instance_id,
-                logic_coords,
-                io_coords,
-                include_io,
-                candidate_xy
-            )
-
-            for j in range(n):
-                _, _, dist = candidate_positions[j]
-                new_hpwl = hpwl_candidates[j]
-                hpwl_change = new_hpwl - current_hpwl
-                distance_penalty = dist * 0.1
-                cost_matrix[i, j] = hpwl_change + distance_penalty
-
-        assignment = self._greedy_assignment(cost_matrix)
-        moved_count = 0
-
-        for i, j in enumerate(assignment):
+        empty.insert(0, (cx, cy, 0))
+        m, n_max = len(conflict_instances), min(len(empty), len(conflict_instances) + 3)
+        cand_pos = empty[:n_max]
+        cand_xy = [(x, y) for x, y, _ in cand_pos]
+        cost = torch.zeros((m, n_max), device=self.device)
+        for i, inst_id in enumerate(conflict_instances):
+            cur = self.placer.net_manager.compute_instance_move_hpwl(inst_id, logic_coords, io_coords, include_io)
+            hpwl_c = self.placer.net_manager.compute_instance_move_hpwl_batch(inst_id, logic_coords, io_coords, include_io, cand_xy)
+            for j in range(n_max):
+                _, _, dist = cand_pos[j]
+                cost[i, j] = (hpwl_c[j] - cur) + dist * 0.1
+        asgn = self._greedy_assignment(cost)
+        moved = 0
+        for i, j in enumerate(asgn):
             if j < 0:
                 continue
-
-            instance_id = conflict_instances[i]
-            target_x, target_y, _ = empty_positions[j]
-
-            current_pos = grid.get_instance_position(instance_id)
-            if current_pos and (current_pos[0] != target_x or current_pos[1] != target_y):
-                success, swapped_with, _ = grid.move_instance(
-                    instance_id, target_x, target_y, swap_allowed=True
-                )
-                if success:
-                    moved_count += 1
-
-        return True, moved_count
+            inst_id = conflict_instances[i]
+            tx, ty, _ = empty[j]
+            cp = grid.get_instance_position(inst_id)
+            if cp and (cp[0]!=tx or cp[1]!=ty):
+                ok, _, _ = grid.move_instance(inst_id, tx, ty, swap_allowed=True)
+                if ok:
+                    moved += 1
+        return True, moved
 
     def _greedy_assignment(self, cost_matrix):
         m, n = cost_matrix.shape
         assigned_positions = set()
         assignment = [-1] * m
-
         for i in range(m):
-            min_cost = float('inf')
-            min_j = -1
-
+            best = float('inf')
+            best_j = -1
             for j in range(n):
-                if j not in assigned_positions and cost_matrix[i, j] < min_cost:
-                    min_cost = cost_matrix[i, j]
-                    min_j = j
-
-            if min_j != -1:
-                assignment[i] = min_j
-                assigned_positions.add(min_j)
-
+                if j not in assigned_positions and cost_matrix[i, j] < best:
+                    best = cost_matrix[i, j]
+                    best_j = j
+            if best_j != -1:
+                assignment[i] = best_j
+                assigned_positions.add(best_j)
         return assignment
 
-    def _global_optimization(self, logic_coords: torch.Tensor,
-                                     io_coords: Optional[torch.Tensor],
-                                     include_io: bool,
-                                     iteration: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-
-        for iter in range(iteration):
+    def _global_optimization(self, legalized: Dict[str, torch.Tensor],
+                             region_ids: Dict[str, torch.Tensor],
+                             iteration: int = 3) -> Dict[str, torch.Tensor]:
+        lc, ioc, inc_io = self._logic_io_from(legalized)
+        for _ in range(iteration):
             improved = False
-
-            logic_improved = self._optimize_grid_instances(
-                self.logic_grid, logic_coords.shape[0], logic_coords, io_coords, include_io
-            )
-            if logic_improved:
-                improved = True
-
-            if include_io:
-                io_improved = self._optimize_grid_instances(
-                    self.io_grid, io_coords.shape[0], logic_coords, io_coords, include_io
-                )
-                if io_improved:
-                    improved = True
-
+            for r in legalized:
+                if r in self.grids:
+                    ok = self._optimize_grid_instances(
+                        self.grids[r], legalized[r].shape[0], lc, ioc, inc_io
+                    )
+                    if ok:
+                        improved = True
             if not improved:
                 break
-
-        optimized_logic = self.logic_grid.to_coords_tensor(logic_coords.shape[0])
-        optimized_io = self.io_grid.to_coords_tensor(io_coords.shape[0]) if include_io else None
-
-        return optimized_logic, optimized_io
+        optimized = {}
+        for r in legalized:
+            if r in self.grids:
+                optimized[r] = self.grids[r].to_coords_tensor(legalized[r].shape[0])
+        return optimized
 
     def _optimize_grid_instances(self, grid: Grid, num_instances: int,
-                                logic_coords: torch.Tensor, io_coords: Optional[torch.Tensor],
-                                include_io: bool) -> bool:
+                                logic_coords, io_coords, include_io) -> bool:
         improved = False
-
         if self.enable_importance_based_swapping:
-            # 重要性感知优化（较慢但质量更好）
             critical_instances = self._select_critical_instances_for_grid(
                 grid, num_instances, logic_coords, io_coords, include_io
             )
@@ -412,7 +338,7 @@ class Legalizer:
         best_hpwl = current_hpwl
 
         # 根据网格类型设置搜索半径
-        search_radius = 2 if grid is self.logic_grid else 1
+        search_radius = 2 if grid.name == 'logic' else 1
 
         # 搜索邻域并收集空位候选
         candidate_xy: List[Tuple[int, int]] = []
@@ -486,7 +412,7 @@ class Legalizer:
         instance_connectivity = self._compute_instance_connectivity(instance_id)
 
         # 根据网格类型设置搜索半径 (Manhattan distance)
-        search_radius = 3 if grid is self.logic_grid else 1
+        search_radius = 3 if grid.name == 'logic' else 1
 
         # 收集邻域内的所有位置（空位或其他实例）
         neighbor_positions = []

@@ -6,16 +6,18 @@ Tests model training, prediction, and dataset handling for alpha parameter optim
 
 import os
 import sys
+
+# Point to project root: tests/unit_test/ → tests/ → project root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import tempfile
 import pytest
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, '.')
-
 from ml.model import create_default_model, save_model, load_model, get_model_path
-from ml.dataset import FIELDNAMES, extract_features_from_placer
-from ml.train import train_from_csv, PRE_ALPHA_FEATURES
+from ml.dataset import FIELDNAMES, extract_features_from_placer, get_feature_fieldnames
+from ml.train import train_from_csv
 from ml.predict import predict_alpha, predict_target
 
 
@@ -72,13 +74,14 @@ class TestMLAlphaDataset:
         assert FIELDNAMES == expected_fields
 
     def test_pre_alpha_features(self):
-        """Test PRE_ALPHA_FEATURES excludes target variables and identifiers."""
-        assert "alpha" not in PRE_ALPHA_FEATURES
-        assert "beta" not in PRE_ALPHA_FEATURES
-        assert "hpwl_after" not in PRE_ALPHA_FEATURES
-        assert "overlap_after" not in PRE_ALPHA_FEATURES
-        assert "instance" not in PRE_ALPHA_FEATURES  # instance is string identifier, not numeric
-        assert "opti_insts_num" in PRE_ALPHA_FEATURES
+        """Test feature fieldnames exclude target variables and identifiers."""
+        feats = get_feature_fieldnames(with_io=False)
+        assert "alpha" not in feats
+        assert "beta" not in feats
+        assert "hpwl_after" not in feats
+        assert "overlap_after" not in feats
+        assert "instance" not in feats
+        assert "opti_insts_num" in feats
 
 
 class TestMLAlphaTraining:
@@ -170,7 +173,7 @@ class TestMLAlphaPrediction:
 
             # Create synthetic training data with proper DataFrame format
             num_samples = 30
-            data = {col: np.random.randn(num_samples) for col in PRE_ALPHA_FEATURES}
+            data = {col: np.random.randn(num_samples) for col in get_feature_fieldnames(with_io=False)}
             X = pd.DataFrame(data)
             y = np.random.uniform(0.5, 2.0, num_samples)
 

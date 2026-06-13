@@ -1,5 +1,5 @@
-set synth_dcp "D:/Project/fem-placer-latest/fem-placer/benchmarks/ISPD/FPGA-example2/design.dcp"  ;# 综合后的DCP
-set output_dir "D:/Project/fem-placer-latest/fem-placer/vivado/output_dir/FPGA-example2"         ;# 输出目录
+set synth_dcp "D:/Project/fem-placer-latest/fem-placer/benchmarks/ISPD/FPGA-example1/design.dcp"  ;# 综合后的DCP
+set output_dir "D:/Project/fem-placer-latest/fem-placer/vivado/output_dir/FPGA-example1"         ;# 输出目录
 set impl_dcp [file join $output_dir "post_impl.dcp"]                                  ;# 实现后的DCP
 
 file mkdir $output_dir

@@ -97,7 +97,7 @@ class TestConfig:
             if key in raw:
                 raw[key] = enum_cls[raw[key]]
 
-        return cls(**{k: v for k, v in raw.items() if hasattr(cls, k)})
+        return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 
 # ---------------------------------------------------------------------------

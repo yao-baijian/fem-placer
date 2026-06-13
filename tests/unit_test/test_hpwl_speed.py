@@ -4,7 +4,7 @@ import sys
 import os
 
 # Assuming fem_placer is in python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from fem_placer.objectives import get_hpwl_loss_qubo, get_hpwl_loss_qubo_sparse_accel
 
 def test_hpwl_speed():

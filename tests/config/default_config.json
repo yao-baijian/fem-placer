@@ -1,13 +1,11 @@
 {
-    "_comment": "Default test configuration. Copy to tests/config/config.json and edit.",
+    "_comment": "Default configuration for regression tests. Run s15850 with logic+IO regions.",
     "instances": [
-        "FPGA-example1"
+        "s15850"
     ],
     "regions": [
         "logic",
-        "io",
-        "clock",
-        "dsp"
+        "io"
     ],
     "verbose": false,
     "grid_type": "SQUARE",

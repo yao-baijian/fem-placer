@@ -282,9 +282,14 @@ class NetManager:
             WARNING(f"Failed to estimate logic depth: {e}, using default value 1.0")
             self.logic_depth = 1.0
 
-    def analyze_solver_hpwl(self, coords, io_coords=None, include_io=False):
+    def analyze_solver_hpwl(self, *region_coords):
+        """Compute HPWL from N region coordinate tensors.
+        Accepts variadic tensors (one per region) and always computes
+        full HPWL (including IO nets when io coords are present).
+        """
         self.hpwl_calculator.clear()
-        instance_coords = self.map_coords_to_instance_func(coords, io_coords, include_io)
+        instance_coords = self.map_coords_to_instance_func(*region_coords)
+        include_io = len(region_coords) > 1
         for net_name, connected_sites in self.net_to_sites.items():
             self.hpwl_calculator.compute_net_hpwl(net_name, connected_sites, instance_coords, include_io=include_io)
         return self.hpwl_calculator.get_hpwl()

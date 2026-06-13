@@ -72,9 +72,19 @@ for instance in cfg.instances:
         placer.set_beta(30)
 
     # Build N-region dicts for the optimizer
-    regions = placer.regions
-    region_sizes = {r: (placer.instances[r].num, placer.get_grid(r).area) for r in regions}
-    region_site_coords = {r: getattr(placer, f'{r}_site_coords') for r in regions}
+    regions = [r for r in placer.regions if placer.instances[r].num > 0]
+    region_sizes = {r: (placer.instances[r].num, max(placer.get_grid(r).area, 1)) for r in regions}
+    region_site_coords = {}
+    for r in regions:
+        attr = f'{r}_site_coords'
+        if hasattr(placer, attr):
+            region_site_coords[r] = getattr(placer, attr)
+        else:
+            g = placer.get_grid(r)
+            region_site_coords[r] = g.to_real_coords_tensor(torch.cartesian_prod(
+                torch.arange(g.area_length, dtype=torch.float32, device=cfg.dev),
+                torch.arange(g.area_width, dtype=torch.float32, device=cfg.dev)
+            ))
     io_mat = placer.net_manager.io_insts_matrix
     region_coupling = {}
     for rA in regions:
@@ -89,7 +99,6 @@ for instance in cfg.instances:
             else:
                 region_coupling[rA][rB] = None
 
-    # Build coefficient lists that map positionally to regions
     coeff_map = {'logic': placer.constraint_alpha, 'io': placer.constraint_beta}
     constraint_coeffs = [coeff_map.get(r, 1.0) for r in regions]
     h_factors = [cfg.io_factor * cfg.h_factor if r == 'io' else cfg.h_factor for r in regions]
@@ -122,27 +131,26 @@ for instance in cfg.instances:
     optimal_inds = torch.argwhere(result == result.min()).reshape(-1)
     legalizer = Legalizer(placer=placer, device=cfg.dev)
     router = Router(placer=placer)
-    logic_ids, io_ids = placer.get_ids()
+    all_ids = placer.get_ids()
+    region_id_map = dict(zip(placer.regions, all_ids))
 
-    include_io = ("io" in placer.regions)
-    if include_io:
-        real_logic_coords = config['logic'][optimal_inds[0]]
-        real_io_coords = config['io'][optimal_inds[0]]
-        legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(
-            real_logic_coords, logic_ids, real_io_coords, io_ids, include_io=True)
-        all_coords = torch.cat([legalized[0], legalized[1]], dim=0)
-        routes = router.route_connections(placer.net_manager.insts_matrix, all_coords)
-    else:
-        real_logic_coords = config['logic'][optimal_inds[0]]
-        legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(
-            real_logic_coords, logic_ids)
-        routes = router.route_connections(placer.net_manager.insts_matrix, legalized[0])
+    # Pick best trial and build region coords/ids dicts
+    best_config = {r: config[r][optimal_inds[0]] for r in config}
+    best_ids = {r: region_id_map[r] for r in config if r in region_id_map}
+
+    # Legalize — returns dict {r: legalized_coords}
+    legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(best_config, best_ids)
+
+    # Route — concatenate all region coords
+    all_coords = torch.cat([legalized[r] for r in legalized], dim=0)
+    routes = router.route_connections(placer.net_manager.insts_matrix, all_coords)
 
     vivado_time_str = str(vivado_place_times.get(instance, "N/A"))
 
+    # Timing — extract logic/io for the legacy timer interface
     timing_result = run_timing_analysis(
         placer=placer,
-        placement_legalized=legalized,
+        placement_legalized=(legalized.get('logic'), legalized.get('io')),
         clock_period_ns=cfg.clock_period_ns,
         use_rapidwright=True,
         instance_name=instance,
@@ -156,7 +164,7 @@ for instance in cfg.instances:
         vivado_hpwl=vivado_hpwl,
         optimize_time=optimize_time, vivado_time_str=vivado_time_str,
         wns_ns=timing_result.wns * 1e9, fmax_mhz=timing_result.fmax,
-        include_io=include_io,
+        include_io=('io' in config),
     ))
     print()
     print(timing_result.format_report())

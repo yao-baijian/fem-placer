@@ -11,7 +11,7 @@ import os
 
 # Add parent directory to path
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fem_placer import objectives
 
@@ -19,7 +19,7 @@ from fem_placer import objectives
 @pytest.fixture
 def objectives_data():
     """Load test fixtures generated from master branch."""
-    fixtures_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'objectives_data.pt')
+    fixtures_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fixtures', 'objectives_data.pt')
     if not os.path.exists(fixtures_path):
         pytest.skip(f"Test fixtures not found at {fixtures_path}")
     return torch.load(fixtures_path, weights_only=False)
