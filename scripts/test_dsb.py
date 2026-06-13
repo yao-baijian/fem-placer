@@ -108,8 +108,8 @@ for instance in instances:
         )
 
         inst_num_val = inst_num['logic_inst_num']
-        hpwl_before_val = hpwl_before['hpwl_no_io']
-        hpwl_after_val = hpwl_after['hpwl_no_io']
+        hpwl_before_val = hpwl_before
+        hpwl_after_val = hpwl_after
 
         print(f"{'Benchmarks':<12} {instance:<10} {inst_num_val:<6} {overlap:<8} "
               f"{hpwl_before_val:<18.2f} {hpwl_after_val:<16.2f} {energy:<12.2f}")

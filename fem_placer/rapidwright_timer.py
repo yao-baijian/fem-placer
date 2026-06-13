@@ -90,6 +90,10 @@ class RapidWrightTimer:
             output_dir = os.path.join(self.work_dir, instance_name)
         os.makedirs(output_dir, exist_ok=True)
 
+        # --- Step 0: Unroute so RWRoute starts fresh instead of trying to
+        #             preserve broken connections on moved SiteInsts ---
+        design.unrouteDesign()
+
         # --- Step 1: Map FEM coords to target sites ---
         self._place_fem_sites(
             design=design,
@@ -193,24 +197,31 @@ class RapidWrightTimer:
         orig_cx = orig_x_sum / num_src
         orig_cy = orig_y_sum / num_src
 
-        # Find the best offset so the target window centroid
-        # is as close as possible to the original centroid
+        # Slide a window of num_src sites over the sorted target list to find
+        # the offset whose centroid best matches the original placement centroid.
+        # If there are fewer target sites than instances, skip the search and
+        # use all available sites starting at offset 0.
         best_offset = 0
-        best_dist = float('inf')
-        max_offset = num_dst - num_src
-        for cand in range(max_offset + 1):
-            xs = [s.getInstanceX() for s in sorted_sites[cand:cand + num_src]]
-            ys = [s.getInstanceY() for s in sorted_sites[cand:cand + num_src]]
-            cx = sum(xs) / num_src
-            cy = sum(ys) / num_src
-            d = (cx - orig_cx) ** 2 + (cy - orig_cy) ** 2
-            if d < best_dist:
-                best_dist = d
-                best_offset = cand
+        if num_src <= num_dst:
+            best_dist = float('inf')
+            max_offset = num_dst - num_src
+            for cand in range(max_offset + 1):
+                xs = [s.getInstanceX() for s in sorted_sites[cand:cand + num_src]]
+                ys = [s.getInstanceY() for s in sorted_sites[cand:cand + num_src]]
+                cx = sum(xs) / num_src
+                cy = sum(ys) / num_src
+                d = (cx - orig_cx) ** 2 + (cy - orig_cy) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_offset = cand
+        else:
+            WARNING(f"[RapidWrightTimer] Only {num_dst} target sites for "
+                    f"{num_src} logic instances — placing into all available sites")
         offset = best_offset
 
-        target_cx = sum(sorted_sites[offset + i].getInstanceX() for i in range(num_src)) / num_src
-        target_cy = sum(sorted_sites[offset + i].getInstanceY() for i in range(num_src)) / num_src
+        win_size = min(num_src, num_dst)
+        target_cx = sum(sorted_sites[offset + i].getInstanceX() for i in range(win_size)) / win_size
+        target_cy = sum(sorted_sites[offset + i].getInstanceY() for i in range(win_size)) / win_size
         INFO(f"[RapidWrightTimer] Placement centroid: original=({orig_cx:.1f}, {orig_cy:.1f}), "
              f"target=({target_cx:.1f}, {target_cy:.1f}), offset={offset}")
 

@@ -54,13 +54,10 @@ class TestConfig:
     dev: str = 'cuda'
     manual_grad: bool = False
     anneal: str = 'exp'
-    io_factor: int = 1
-    alpha: int = 0
-    beta: int = 0
-    alpha_factor: int = 1
-    beta_factor: int = 1
     learning_rate: float = 0.1
-    h_factor: float = 0.01
+    coeff_list: List[float] = field(default_factory=lambda: [0.0])
+    coeff_factor_list: List[float] = field(default_factory=lambda: [1.0])
+    h_factor_list: List[float] = field(default_factory=lambda: [0.01])
     betamin: float = 0.01
     betamax: float = 0.5
     seed: int = 1
@@ -264,17 +261,13 @@ def run_timing_analysis(
             route_design=True,
         )
     else:
-        from fem_placer import VivadoTimingRunner
-        timer = VivadoTimingRunner(vivado_path='vivado')
-        return timer.run(
-            design=placer.design,
-            placer=placer,
+        from fem_placer.timer import TimingAnalyzer
+        analyzer = TimingAnalyzer(clock_period=clock_period_ns * 1e-9)
+        return analyzer.analyze_framework(
+            net_manager=placer.net_manager,
             logic_coords=logic_coords,
             io_coords=io_coords,
             include_io=(io_coords is not None),
-            clock_period_ns=clock_period_ns,
-            instance_name=instance_name,
-            run_vivado=True,
         )
 
 
@@ -314,28 +307,22 @@ def format_result_row(
     overlap: float,
     used_alpha: float,
     used_beta: float,
-    fem_hpwl_initial: Dict[str, float],
-    fem_hpwl_final: Dict[str, float],
-    vivado_hpwl: Dict[str, float],
+    fem_hpwl_initial: float,
+    fem_hpwl_final: float,
+    vivado_hpwl: float,
     optimize_time: float,
     vivado_time_str: str,
     wns_ns: float,
     fmax_mhz: float,
-    include_io: bool = False,
 ) -> str:
     """Format a single result row matching the header columns."""
-    hpwl_init_key = 'hpwl' if include_io else 'hpwl_no_io'
-    hpwl_final_key = 'hpwl' if include_io else 'hpwl_no_io'
-    hpwl_viv_key = 'hpwl' if include_io else 'hpwl_no_io'
-
     io_inst_val = inst_num.get('io_inst_num', 0)
     return (
         f"{'Benchmarks':<12} {instance:<10} {inst_num['logic_inst_num']:<6} "
         f"{io_inst_val:<6} {net_ratio:<14} {overlap:<8} "
         f"{used_alpha:<8.2f} {used_beta:<8.2f} "
-        f"{fem_hpwl_initial.get(hpwl_init_key, 0):<18.2f} "
-        f"{fem_hpwl_final.get(hpwl_final_key, 0):<16.2f} "
-        f"{vivado_hpwl.get(hpwl_viv_key, 0):<12.2f} "
+        f"{fem_hpwl_initial:<18.2f} {fem_hpwl_final:<16.2f} "
+        f"{vivado_hpwl:<12.2f} "
         f"{optimize_time:<10.2f} {vivado_time_str:<10} "
         f"{wns_ns:<14.3f} {fmax_mhz:<12.1f}"
     )

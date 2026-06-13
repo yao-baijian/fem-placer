@@ -85,11 +85,7 @@ class NetManager:
             if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
                 # Still need to try both include_io variants to keep dicts consistent
                 self.hpwl_calculator.compute_net_hpwl_rapidwright(
-                    net, net_name, include_io=True,
-                    logic_instances=logic_instances, io_instances=io_instances
-                )
-                self.hpwl_calculator.compute_net_hpwl_rapidwright(
-                    net, net_name, include_io=False,
+                    net, net_name,
                     logic_instances=logic_instances, io_instances=io_instances
                 )
                 continue
@@ -135,16 +131,6 @@ class NetManager:
                 self.hpwl_calculator.total_hpwl += hpwl
                 hpwl_io_count += 1
 
-            # --- HPWL without IO ---
-            if len(logic_coords_set) >= 2:
-                hpwl_no_io, bbox_no_io = self.hpwl_calculator._compute_hpwl_from_coordinates(
-                    list(logic_coords_set)
-                )
-                self.hpwl_calculator.net_hpwl_no_io[net_name] = hpwl_no_io
-                self.hpwl_calculator.net_bbox_no_io[net_name] = bbox_no_io
-                self.hpwl_calculator.total_hpwl_no_io += hpwl_no_io
-                hpwl_no_io_count += 1
-
             # --- Logic depth: update site connectivity (from all sites in net) ---
             for site in sites_in_net:
                 site_connectivity[site] = site_connectivity.get(site, 0) + len(sites_in_net)
@@ -158,8 +144,7 @@ class NetManager:
                 INFO(f"  HPWL progress: {idx+1}/{total_nets} nets processed ({100*(idx+1)//total_nets}%)")
 
         hpwl = self.hpwl_calculator.get_hpwl()
-        INFO(f"Nets num: {total_nets}, total hpwl: {hpwl['hpwl']:.2f}, without io: {hpwl['hpwl_no_io']:.2f} "
-             f"(hpwl_io_nets={hpwl_io_count}, hpwl_no_io_nets={hpwl_no_io_count})")
+        INFO(f"Nets num: {total_nets}, total hpwl: {hpwl:.2f}")
 
         # --- Estimate logic depth from collected data ---
         self._estimate_logic_depth_from_data(site_connectivity)
@@ -285,13 +270,12 @@ class NetManager:
     def analyze_solver_hpwl(self, *region_coords):
         """Compute HPWL from N region coordinate tensors.
         Accepts variadic tensors (one per region) and always computes
-        full HPWL (including IO nets when io coords are present).
+        full HPWL (including all placed regions).
         """
         self.hpwl_calculator.clear()
         instance_coords = self.map_coords_to_instance_func(*region_coords)
-        include_io = len(region_coords) > 1
         for net_name, connected_sites in self.net_to_sites.items():
-            self.hpwl_calculator.compute_net_hpwl(net_name, connected_sites, instance_coords, include_io=include_io)
+            self.hpwl_calculator.compute_net_hpwl(net_name, connected_sites, instance_coords)
         return self.hpwl_calculator.get_hpwl()
 
     def save_net_debug_info(self, output_path=None):
@@ -301,7 +285,7 @@ class NetManager:
             f.write("Net_IDX\tNet_Name\tHPWL\tSite_Count\tSites_Info\n")
             for idx, net in enumerate(self.nets):
                 net_name = net.getName()
-                hpwl = self.hpwl_calculator.net_hpwl_no_io.get(net_name, 0.0)
+                hpwl = self.hpwl_calculator.net_hpwl.get(net_name, 0.0)
 
                 sites_set = set()
                 if not (net.isClockNet() or net.isVCCNet() or net.isGNDNet()):

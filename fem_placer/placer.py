@@ -100,8 +100,13 @@ class FpgaPlacer:
         self.logic_site_coords = None
         self.site_coords_all = None
         self.device = device
-        self.constraint_alpha = 0
-        self.constraint_beta = 0
+        self.constraint_coeffs = {}
+        # Read per-region constraint coefficients from config if available
+        if config is not None:
+            raw_coeffs = getattr(config, 'coeff_list', None)
+            if raw_coeffs is not None:
+                for r, cc in zip(self.regions, raw_coeffs):
+                    self.constraint_coeffs[r] = cc
         self.instance_name = None
         self.result_dir = 'result'
         pass
@@ -132,11 +137,31 @@ class FpgaPlacer:
             return True
         return False
     
-    def set_alpha(self, alpha):
-        self.constraint_alpha = alpha
-        
-    def set_beta(self, beta):
-        self.constraint_beta = beta
+    def set_constraint_coeff(self, region: str, value: float):
+        self.constraint_coeffs[region] = value
+
+    # Backward-compatible wrappers
+    @property
+    def constraint_alpha(self):
+        return self.constraint_coeffs.get('logic', 0)
+
+    @constraint_alpha.setter
+    def constraint_alpha(self, value: float):
+        self.constraint_coeffs['logic'] = value
+
+    @property
+    def constraint_beta(self):
+        return self.constraint_coeffs.get('io', 0)
+
+    @constraint_beta.setter
+    def constraint_beta(self, value: float):
+        self.constraint_coeffs['io'] = value
+
+    def set_alpha(self, value: float):
+        self.constraint_coeffs['logic'] = value
+
+    def set_beta(self, value: float):
+        self.constraint_coeffs['io'] = value
     
     def get_grid(self, grid_name) -> Grid:
         return self.grids[grid_name]
@@ -310,7 +335,14 @@ class FpgaPlacer:
         self.total_insts_num = len(design.getSiteInsts())
         classified = sum(self.instances[r].num for r in self.regions if r in self.instances)
         self.other_insts_num = self.total_insts_num - classified
-        self.constraint_alpha = self.instances['logic'].num / 2
+        # Fill missing per-region coeffs with heuristic defaults
+        for r in self.regions:
+            if r in self.constraint_coeffs:
+                continue
+            if r == 'logic':
+                self.constraint_coeffs[r] = self.instances['logic'].num / 2
+            elif r == 'io':
+                self.constraint_coeffs[r] = self.constraint_coeffs.get('logic', 0)
 
         stat_parts = ' + '.join(f"{self.instances[r].num} {r}" for r in self.regions if r in self.instances)
         INFO(f"Sites stat: {stat_parts}, {self.other_insts_num} other, "
@@ -593,8 +625,7 @@ class FpgaPlacer:
             'num_site': self.grids['logic'].area,
             'num_fixed_site': self.grids['io'].area if 'io' in self.grids else 0,
             'logic_grid_width': self.grids['logic'].area_width,
-            'constraint_alpha': self.constraint_alpha,
-            'constraint_beta': self.constraint_beta,
+            'constraint_coeffs': dict(self.constraint_coeffs),
             'device': self.device,
             'place_orientation': self.place_orientation.name if hasattr(self.place_orientation, 'name') else str(self.place_orientation),
             'grid_type': self.grid_type.name if hasattr(self.grid_type, 'name') else str(self.grid_type),

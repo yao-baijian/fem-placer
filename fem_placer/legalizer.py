@@ -67,17 +67,13 @@ class Legalizer:
         hpwl_before = self.placer.net_manager.analyze_solver_hpwl(*all_coords_before)
         hpwl_after  = self.placer.net_manager.analyze_solver_hpwl(*all_coords_after)
         moved_str = ' + '.join(f"{r}: {m}" for r, m in zip(regions, [0]*len(regions)))
-        INFO(f"Hpwl {hpwl_before.get('hpwl', hpwl_before.get('hpwl_no_io', 0)):.2f} -> "
-             f"{hpwl_after.get('hpwl', hpwl_after.get('hpwl_no_io', 0)):.2f}, "
-             f"moved {total_moved} instances")
+        INFO(f"Hpwl {hpwl_before:.2f} -> {hpwl_after:.2f}, moved {total_moved} instances")
 
         INFO(f"Stage 2: global optimization")
         optimized = self._global_optimization(legalized, region_ids, iteration=3)
         all_coords_opt = [optimized[r] for r in regions]
         hpwl_opt = self.placer.net_manager.analyze_solver_hpwl(*all_coords_opt)
-        hpwl_after_val = hpwl_after.get('hpwl', hpwl_after.get('hpwl_no_io', 0))
-        hpwl_opt_val = hpwl_opt.get('hpwl', hpwl_opt.get('hpwl_no_io', 0))
-        INFO(f"Optimized Hpwl {hpwl_opt_val:.2f}, improve {hpwl_opt_val - hpwl_after_val:.2f}")
+        INFO(f"Optimized Hpwl {hpwl_opt:.2f}, improve {hpwl_opt - hpwl_after:.2f}")
 
         return optimized, total_moved, hpwl_before, hpwl_opt
 

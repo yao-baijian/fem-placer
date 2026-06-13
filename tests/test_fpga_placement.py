@@ -38,6 +38,50 @@ from ml.predict import predict_alpha
 import json
 import os
 
+
+def compute_site_density_scaled_hpwl(placer, legalized: dict, hpwl_value: float) -> tuple:
+    r"""
+    Compute the Site-Level Pin-Count Density Scaled HPWL.
+
+    .. math::
+        \text{Scaled HPWL} = \frac{\text{HPWL}}{\sum_i (P_i^{\text{site}} - 1)}
+
+    where :math:`P_i^{\text{site}}` is the number of unique physical placement
+    sites net :math:`i` occupies after legalization.
+
+    Returns:
+        ``(scaled_hpwl, total_site_penalty)``.
+    """
+    # Build instance_coords dict from legalized regions (in placer.regions order)
+    region_coords = [legalized[r] for r in placer.regions if r in legalized]
+    instance_coords = placer.map_coords_to_instance(*region_coords)
+
+    hpwl_val = hpwl_value
+
+    total_site_penalty = 0
+    for net_name, site_names in placer.net_manager.net_to_sites.items():
+        # Collect unique (x, y) coordinate tuples among this net's sites
+        unique_coords = set()
+        for site_name in site_names:
+            if site_name in instance_coords:
+                coord = instance_coords[site_name]
+                if isinstance(coord, torch.Tensor):
+                    coord_key = (round(float(coord[0]), 4), round(float(coord[1]), 4))
+                else:
+                    coord_key = (round(float(coord[0]), 4), round(float(coord[1]), 4))
+                unique_coords.add(coord_key)
+        p_i_site = len(unique_coords)
+        if p_i_site >= 2:
+            total_site_penalty += (p_i_site - 1)
+
+    if total_site_penalty > 0:
+        scaled_hpwl = hpwl_val / total_site_penalty
+    else:
+        scaled_hpwl = float('inf')
+
+    return scaled_hpwl, total_site_penalty
+
+
 cfg = TestConfig.load()
 SET_LEVEL("INFO")
 
@@ -64,15 +108,17 @@ for instance in cfg.instances:
     net_ratio = f"{net_num['logic_net_num']}/{net_num['total_net_num']}"
     drawer = PlacementDrawer(placer=placer)
 
+    # ML-predicted constraint-coeff override (optional — placer already reads coeff_list from config)
     # row = extract_features_from_placer(placer, alpha=0, beta=0, with_io=False)
-    # alpha_val = predict_alpha(row) * 0.001
-    alpha_val = 30
-    placer.set_alpha(alpha_val)
-    if "io" in placer.regions:
-        placer.set_beta(30)
+    # predicted = predict_alpha(row) * 0.001
+    # placer.set_constraint_coeff('logic', predicted)
 
     # Build N-region dicts for the optimizer
     regions = [r for r in placer.regions if placer.instances[r].num > 0]
+    # Pick per-region values from the three parallel lists
+    constraint_coeffs = [cfg.coeff_list[placer.regions.index(r)] for r in regions]
+    h_factors = [cfg.h_factor_list[placer.regions.index(r)] for r in regions]
+
     region_sizes = {r: (placer.instances[r].num, max(placer.get_grid(r).area, 1)) for r in regions}
     region_site_coords = {}
     for r in regions:
@@ -98,10 +144,6 @@ for instance in cfg.instances:
                 region_coupling[rA][rB] = io_mat.T.clone()
             else:
                 region_coupling[rA][rB] = None
-
-    coeff_map = {'logic': placer.constraint_alpha, 'io': placer.constraint_beta}
-    constraint_coeffs = [coeff_map.get(r, 1.0) for r in regions]
-    h_factors = [cfg.io_factor * cfg.h_factor if r == 'io' else cfg.h_factor for r in regions]
 
     optimizer = FPGAPlacementOptimizer(
         regions=regions,
@@ -152,22 +194,35 @@ for instance in cfg.instances:
         placer=placer,
         placement_legalized=(legalized.get('logic'), legalized.get('io')),
         clock_period_ns=cfg.clock_period_ns,
-        use_rapidwright=True,
+        use_rapidwright=False,
         instance_name=instance,
     )
 
+    # Constraint coeffs from placer (set internally from coeff_list or ML override)
+    used_alpha = placer.constraint_coeffs.get('logic', 0.0)
+    used_beta = placer.constraint_coeffs.get('io', 0.0)
     print(format_result_row(
         instance=instance, inst_num=inst_num, net_ratio=net_ratio,
         overlap=overlap,
-        used_alpha=alpha_val, used_beta=0.0,
+        used_alpha=used_alpha, used_beta=used_beta,
         fem_hpwl_initial=hpwl_i, fem_hpwl_final=hpwl_f,
         vivado_hpwl=vivado_hpwl,
         optimize_time=optimize_time, vivado_time_str=vivado_time_str,
         wns_ns=timing_result.wns * 1e9, fmax_mhz=timing_result.fmax,
-        include_io=('io' in config),
     ))
     print()
     print(timing_result.format_report())
+    print()
+
+    # --- Site-Level Pin-Count Density Scaled HPWL ---
+    scaled_hpwl, site_penalty = compute_site_density_scaled_hpwl(
+        placer, legalized, hpwl_f
+    )
+    INFO(f"Site-Level Scaled HPWL: {scaled_hpwl:.4f}  "
+         f"(HPWL={hpwl_f:.2f}, sum(P_i_site-1)={site_penalty})")
+    print(f"  Site-Level Scaled HPWL .. : {scaled_hpwl:<12.4f}  "
+          f"(HPWL={hpwl_f:<10.2f}  "
+          f"Σ(Pᵢ⁻site−1)={site_penalty})")
     print()
 
     if cfg.draw_loss_function:

@@ -15,11 +15,8 @@ class HPWLCalculator:
     def __init__(self, device, debug=False):
         self.net_hpwl = {}
         self.net_bbox = {}
-        self.net_hpwl_no_io = {}
-        self.net_bbox_no_io = {}
 
         self.total_hpwl = 0.0
-        self.total_hpwl_no_io = 0.0
 
         self.nets = []
         self.net_names = []
@@ -28,21 +25,14 @@ class HPWLCalculator:
         pass
 
     def get_hpwl(self):
-        return {
-            'hpwl': self.total_hpwl,
-            'hpwl_no_io': self.total_hpwl_no_io
-            }
+        return self.total_hpwl
 
     def clear(self):
         self.total_hpwl = 0.0
         self.net_hpwl.clear()
         self.net_bbox.clear()
 
-        self.total_hpwl_no_io = 0.0
-        self.net_hpwl_no_io.clear()
-        self.net_bbox_no_io.clear()
-
-    def compute_net_hpwl_rapidwright(self, net, net_name, include_io=False, logic_instances=None, io_instances=None):
+    def compute_net_hpwl_rapidwright(self, net, net_name, logic_instances=None, io_instances=None):
         if net.isClockNet() or net.isVCCNet() or net.isGNDNet():
             return 0.0, {}
 
@@ -66,10 +56,6 @@ class HPWLCalculator:
                 # Ignore sites not part of our optimizable/fixed problem entirely
                 continue
                 
-            if not include_io and is_io:
-                # If we don't include IO, skip any site classified as IO
-                continue
-                
             coord = (site_inst.getInstanceX(), site_inst.getInstanceY())
             coordinates_set.add(coord)
 
@@ -80,40 +66,27 @@ class HPWLCalculator:
 
         hpwl, bbox = self._compute_hpwl_from_coordinates(coordinates)
 
-        if include_io:
-            self.net_hpwl[net_name] = hpwl
-            self.net_bbox[net_name] = bbox
-            self.total_hpwl += hpwl
-        else:
-            self.net_hpwl_no_io[net_name] = hpwl
-            self.net_bbox_no_io[net_name] = bbox
-            self.total_hpwl_no_io += hpwl
+        self.net_hpwl[net_name] = hpwl
+        self.net_bbox[net_name] = bbox
+        self.total_hpwl += hpwl
 
-    def compute_net_hpwl(self, net_name, connected_sites, instance_coords, include_io=False):
+    def compute_net_hpwl(self, net_name, connected_sites, instance_coords):
         coordinates = []
 
         for site_name in connected_sites:
             if site_name in instance_coords:
                 coordinates.append(instance_coords[site_name])
-            else:
-                # WARNING(f"Site {site_name} not found in instance coordinates for net {net_name}")
-                pass
 
         if len(coordinates) < 2:
             return 0.0, {}
 
         hpwl, bbox = self._compute_hpwl_from_coordinates(coordinates)
 
-        if include_io:
-            self.net_hpwl[net_name] = hpwl
-            self.net_bbox[net_name] = bbox
-            self.total_hpwl += hpwl
-        else:
-            self.net_hpwl_no_io[net_name] = hpwl
-            self.net_bbox_no_io[net_name] = bbox
-            self.total_hpwl_no_io += hpwl
+        self.net_hpwl[net_name] = hpwl
+        self.net_bbox[net_name] = bbox
+        self.total_hpwl += hpwl
 
-    def compute_single_instance_hpwl(self, connected_sites, instance_coords):
+    def compute_single_instance_hpwl(self, connected_sites, instance_coords, include_io=True):
         coordinates = []
 
         for site_name in connected_sites:
