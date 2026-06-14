@@ -1,0 +1,17 @@
+<vpr_constraints tool_name="vpr">
+    <partition_list>
+        <!-- 上边缘虚拟 IO -->
+        <partition name="VirtualIO_Top">
+            <add_atom name_pattern="vio_top_*"/>
+            <!-- y=0 固定在上边缘 -->
+            <add_region x_low="0" y_low="0" x_high="100" y_high="0"/>
+        </partition>
+        
+        <!-- 下边缘虚拟 IO -->
+        <partition name="VirtualIO_Bottom">
+            <add_atom name_pattern="vio_bottom_*"/>
+            <!-- y_max 固定在下边缘 -->
+            <add_region x_low="0" y_low="50" x_high="100" y_high="50"/>
+        </partition>
+    </partition_list>
+</vpr_constraints>
