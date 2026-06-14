@@ -283,8 +283,8 @@ class FPGAPlacementOptimizer:
               result is HPWL values [num_trials]
         """
         import time as _time
-        _t_infer = _time.time()
         ps = self.iterate_placement()
+        _t_infer = _time.time()
         config, result = infer_placements_with_regions(
             region_ps=ps,
             region_site_coords=self.region_site_coords,
