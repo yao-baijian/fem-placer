@@ -225,8 +225,12 @@ class FPGAPlacementOptimizer:
         Returns:
             Dict[r] → softmax probability tensor [num_trials, N_r, M_r]
         """
+        import time as _time
+        _t_prep = _time.time()
         hs = self._initialize()
         opt = self._setup_optimizer(list(hs.values()))
+        _prep_time = _time.time() - _t_prep
+        INFO(f"Data preparation (distances + init) took {_prep_time:.2f}s")
 
         # CUDA memory tracking
         cuda_available = self.dev != 'cpu' and torch.cuda.is_available()
@@ -236,6 +240,7 @@ class FPGAPlacementOptimizer:
             mem_initial = torch.cuda.memory_allocated()
             INFO(f"CUDA memory before optimization: {mem_initial / 1024**2:.2f} MB")
 
+        _t_loop = _time.time()
         for step in range(self.num_steps):
             ps = {r: torch.softmax(hs[r], dim=2) for r in self.regions}
             opt.zero_grad()
@@ -254,6 +259,9 @@ class FPGAPlacementOptimizer:
 
             if cuda_available:
                 mem_log.append(torch.cuda.memory_allocated())
+
+        _loop_time = _time.time() - _t_loop
+        INFO(f"Iteration loop ({self.num_steps} steps) took {_loop_time:.2f}s")
 
         if cuda_available and mem_log:
             mem_tensor = torch.tensor(mem_log, device='cpu', dtype=torch.float64)
@@ -274,6 +282,8 @@ class FPGAPlacementOptimizer:
               config is a Dict[r] → instance coords [num_trials, N_r, 2]
               result is HPWL values [num_trials]
         """
+        import time as _time
+        _t_infer = _time.time()
         ps = self.iterate_placement()
         config, result = infer_placements_with_regions(
             region_ps=ps,
@@ -281,4 +291,5 @@ class FPGAPlacementOptimizer:
             region_coupling=self.region_coupling,
             region_distances=self._region_distances,
         )
+        INFO(f"Placement inference took {_time.time() - _t_infer:.2f}s")
         return config, result

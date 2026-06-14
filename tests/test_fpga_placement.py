@@ -39,47 +39,18 @@ import json
 import os
 
 
-def compute_site_density_scaled_hpwl(placer, legalized: dict, hpwl_value: float) -> tuple:
-    r"""
-    Compute the Site-Level Pin-Count Density Scaled HPWL.
+# Method 1: Footprint-Scaled HPWL = Total_HPWL / (Num_Instances * sqrt(Num_Instances))
+def compute_footprint_scaled_hpwl(hpwl_value: float, num_instances: int) -> float:
+    r"""HPWL normalized by instance footprint: :math:`\frac{HPWL}{N \sqrt{N}}`."""
+    denom = num_instances * (num_instances ** 0.5)
+    return hpwl_value / denom if denom > 0 else float('inf')
 
-    .. math::
-        \text{Scaled HPWL} = \frac{\text{HPWL}}{\sum_i (P_i^{\text{site}} - 1)}
 
-    where :math:`P_i^{\text{site}}` is the number of unique physical placement
-    sites net :math:`i` occupies after legalization.
-
-    Returns:
-        ``(scaled_hpwl, total_site_penalty)``.
-    """
-    # Build instance_coords dict from legalized regions (in placer.regions order)
-    region_coords = [legalized[r] for r in placer.regions if r in legalized]
-    instance_coords = placer.map_coords_to_instance(*region_coords)
-
-    hpwl_val = hpwl_value
-
-    total_site_penalty = 0
-    for net_name, site_names in placer.net_manager.net_to_sites.items():
-        # Collect unique (x, y) coordinate tuples among this net's sites
-        unique_coords = set()
-        for site_name in site_names:
-            if site_name in instance_coords:
-                coord = instance_coords[site_name]
-                if isinstance(coord, torch.Tensor):
-                    coord_key = (round(float(coord[0]), 4), round(float(coord[1]), 4))
-                else:
-                    coord_key = (round(float(coord[0]), 4), round(float(coord[1]), 4))
-                unique_coords.add(coord_key)
-        p_i_site = len(unique_coords)
-        if p_i_site >= 2:
-            total_site_penalty += (p_i_site - 1)
-
-    if total_site_penalty > 0:
-        scaled_hpwl = hpwl_val / total_site_penalty
-    else:
-        scaled_hpwl = float('inf')
-
-    return scaled_hpwl, total_site_penalty
+# Method 2: Grid-Perimeter Normalized HPWL = Total_HPWL / (Grid_Width + Grid_Height)
+def compute_grid_perimeter_scaled_hpwl(hpwl_value: float, grid_width: float, grid_height: float) -> float:
+    r"""HPWL normalized by grid perimeter: :math:`\frac{HPWL}{W + H}`."""
+    perimeter = grid_width + grid_height
+    return hpwl_value / perimeter if perimeter > 0 else float('inf')
 
 
 cfg = TestConfig.load()
@@ -181,7 +152,9 @@ for instance in cfg.instances:
     best_ids = {r: region_id_map[r] for r in config if r in region_id_map}
 
     # Legalize — returns dict {r: legalized_coords}
+    t_leg = time.time()
     legalized, overlap, hpwl_i, hpwl_f = legalizer.legalize_placement(best_config, best_ids)
+    INFO(f"Legalization finished in {time.time() - t_leg:.2f}s")
 
     # Route — concatenate all region coords
     all_coords = torch.cat([legalized[r] for r in legalized], dim=0)
@@ -210,19 +183,19 @@ for instance in cfg.instances:
         optimize_time=optimize_time, vivado_time_str=vivado_time_str,
         wns_ns=timing_result.wns * 1e9, fmax_mhz=timing_result.fmax,
     ))
-    print()
-    print(timing_result.format_report())
+    INFO(f"Timing report:\n{timing_result.format_report()}")
     print()
 
-    # --- Site-Level Pin-Count Density Scaled HPWL ---
-    scaled_hpwl, site_penalty = compute_site_density_scaled_hpwl(
-        placer, legalized, hpwl_f
-    )
-    INFO(f"Site-Level Scaled HPWL: {scaled_hpwl:.4f}  "
-         f"(HPWL={hpwl_f:.2f}, sum(P_i_site-1)={site_penalty})")
-    print(f"  Site-Level Scaled HPWL .. : {scaled_hpwl:<12.4f}  "
-          f"(HPWL={hpwl_f:<10.2f}  "
-          f"Σ(Pᵢ⁻site−1)={site_penalty})")
+    # --- Normalized HPWL metrics ---
+    num_inst = sum(placer.instances[r].num for r in regions)
+    grid_w = placer.get_grid('logic').area_width
+    grid_h = placer.get_grid('logic').area_length
+    fp_hpwl = compute_footprint_scaled_hpwl(hpwl_f, num_inst)
+    gp_hpwl = compute_grid_perimeter_scaled_hpwl(hpwl_f, grid_w, grid_h)
+    INFO(f"Footprint-Scaled HPWL: {fp_hpwl:.4f}  "
+         f"(HPWL={hpwl_f:.2f}, N={num_inst})")
+    INFO(f"Grid-Perimeter HPWL: {gp_hpwl:.4f}  "
+         f"(HPWL={hpwl_f:.2f}, W+H={grid_w+grid_h})")
     print()
 
     if cfg.draw_loss_function:
